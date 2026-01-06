@@ -1,8 +1,8 @@
 # Bugs found in Database Management Systems
 
-We have successfully discovered 33 bugs (16 fixed, 24 confirmed and 9 open reported) from real-world production-level DBMSs, including 5 bugs in MySQL, 2 bugs in PostgreSQL, 20 bugs in TiDB, 3 bugs in OpenGauss, and 3 bugs in Oceanbase.
+We have successfully discovered 51 bugs (16 fixed, 39 confirmed and 12 open reported) from real-world production-level DBMSs, including 5 bugs in MySQL, 2 bugs in PostgreSQL, 19 bugs in TiDB, 3 bugs in OpenGauss, 3 bugs in Oceanbase, and 19 bugs in TDSQL.
 
-We are thankful to the DBMS developers for responding to our bug reports and fixing the bugs that we found. Because the nondeterministic interleavings among operations challenges the reproducibility of the isolation-related bugs, there are 9 bugs can not be reproduced but open reported. In the future, we will aim to the research question about reproducing an isolation-related bug.
+We are thankful to the DBMS developers for responding to our bug reports and fixing the bugs that we found. Because the nondeterministic interleavings among operations challenges the reproducibility of the isolation-related bugs, there are 12 bugs can not be reproduced but open reported. In the future, we will aim to the research question about reproducing an isolation-related bug.
 
 We have anonymized the corresponding issue and other personal information due to the double-blind reviewing constraint.
 
@@ -825,3 +825,500 @@ After confirmation with developer, the repeatable read isolation level of Oceanb
 2. No transaction modify the record that has been modified by another concurrent transaction.
 
 However, Oceanbase violates the first rule of snapshot isolation. Specifically, after transaction 1 obtains the consistency snapshot, another parallel transaction 2 issues a write operation. Transaction 1 should not see the write result created by transaction 2. In practice, transaction 1 sees it.
+
+
+
+## TDSQL
+
+#### Bug#33 [Confirmed] Server Crash in deadlock scenario involving partitioned table
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                                         | **State**                                                    |
+| ----------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Schema Creation         | CREATE TABLE tbl_1 (col_1_1 TINYINT, col_1_2 INT, col_1_3 INT, col_1_4 TIMESTAMP, pkid_1 INT, version_1 VARCHAR(200), PRIMARY KEY idx_1_1 (col_1_2)) PARTITION BY LIST (col_1_2) (PARTITION p_low VALUES IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11), PARTITION p_high VALUES IN (12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22));<br>CREATE TABLE tbl_2 (col_2_1 INT, col_2_2 MEDIUMINT, col_2_3 INT, col_2_4 VARCHAR(100), pkid_2 INT, version_2 VARCHAR(200), PRIMARY KEY idx_2_1 (col_2_3)); | Success                                                      |
+| Database Initialization | INSERT INTO tbl_1 VALUES ('', 1, 20, 1, 8, {ts '2025-12-23 19:08:33.0'});<br>INSERT INTO tbl_2 VALUES (8, 1, 'str_002', '', 19, 1);<br>INSERT INTO tbl_1 VALUES ('', 2, 2, 1, 10, {ts '2025-12-23 19:08:33.0'});<br>INSERT INTO tbl_2 VALUES (10, 1, 'str_002', '', 22, 1); | Success                                                      |
+| Session 1               | BEGIN;                                                       | Success                                                      |
+| Session 1               | SELECT tbl_2.col_2_3, tbl_2.pkid_2, tbl_2.version_2 FROM tbl_2 WHERE tbl_2.col_2_4 = 'str_003' FOR SHARE; | Success                                                      |
+| Session 2               | BEGIN;                                                       | Success                                                      |
+| Session 2               | DELETE FROM tbl_2 WHERE tbl_2.col_2_4 = 'str_003';           | Blocked                                                      |
+| **Session 1**           | **UPDATE tbl_1 SET tbl_1.col_1_2 = 7, tbl_1.version_1 = CONCAT(tbl_1.version_1, 'T0') WHERE tbl_1.col_1_4 = {ts '2025-12-23 19:08:33.0'};** | **ERROR 2013: Lost connection to MySQL server during query X** |
+
+**Bug Description**
+
+In this test case, Session 1 first acquires a shared lock (FOR SHARE) on `tbl_2` for a non-existent value 'str_003'. Session 2 attempts to delete records with the same condition 'str_003' from `tbl_2` and gets blocked, waiting for the lock held by Session 1 (likely due to gap locking).
+
+Subsequently, Session 1 attempts to update `tbl_1`. Note that `tbl_1` is a partitioned table, and the update operation modifies `col_1_2`, which is the partition key (changing the value from 20 to 7). This update requires moving the row from partition `p_high` to `p_low`. Instead of completing the transaction or detecting a deadlock, the server crashes, and the client loses the connection with `ERROR 2013`. This indicates a critical stability issue when handling partition key updates under specific locking conditions.
+
+
+
+#### Bug#34 [Open] Unexpected deadlock with SELECT FOR SHARE and ALTER TABLE
+
+See [MySQL Bugs: #119521: Deadlock with SELECT FOR SHARE but not FOR UPDATE](https://bugs.mysql.com/bug.php?id=119521)
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                                         | **State**                                                    |
+| ----------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Schema Creation         | drop table if exists table1;<br>create table table1 (pkId int primary key, colA int); | Success                                                      |
+| Database Initialization | insert into table1 values (5, 100), (15, 200), (30, 100);    | Success                                                      |
+| Session 1               | begin;                                                       | Success                                                      |
+| Session 2               | begin;                                                       | Success                                                      |
+| Session 1               | select pkId, colA from table1 where pkId between 10 and 20 LOCK IN SHARE MODE; | Success                                                      |
+| Session 2               | update table1 set colA = 50 where pkId = 30;                 | Success                                                      |
+| Session 3               | ALTER TABLE table1 ADD UNIQUE (colA);                        | Blocked                                                      |
+| **Session 1**           | **DELETE FROM table1 WHERE pkId = 30;**                      | **ERROR 1213 (40001): Deadlock found when trying to get lock X** |
+
+**Bug Description**
+
+In this scenario, Session 1 holds a shared lock on a range, Session 2 updates a row outside that range, and Session 3 attempts an `ALTER TABLE` to add a unique index (which waits for metadata locks). When Session 1 subsequently attempts to delete the row updated by Session 2, a deadlock error occurs immediately.
+
+However, if the operation in Session 1 is changed from `LOCK IN SHARE MODE` (Shared Lock) to `FOR UPDATE` (Exclusive Lock), the deadlock does not occur. Instead, the `DELETE` operation in Session 1 is merely blocked, waiting for locks to be released. Once Session 2 commits, Session 1 proceeds successfully, and finally Session 3 completes. The fact that a weaker lock (`SHARE`) triggers a deadlock while a stronger lock (`UPDATE`) does not indicates an anomaly in lock dependency handling or metadata locking logic in MySQL 8.4.
+
+
+
+#### Bug#35 [Confirmed] Server crash when using PreparedStatement with IN clause on partitioned table
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                                         | **State**                            |
+| ----------------------- | ------------------------------------------------------------ | ------------------------------------ |
+| Schema Creation         | create table table0 (pkId integer, pkAttr0 decimal(10, 0), primary key(pkAttr0)) PARTITION BY key() PARTITIONS 43;<br>alter table table0 add index table0index_pk(pkAttr0); | Success                              |
+| Database Initialization | insert into table0 (pkId,pkAttr0) values ("0","3.0");<br>insert into table0 (pkId,pkAttr0) values ("1","8.0");<br>... (Insert total 30 rows) ...<br>insert into table0 (pkId,pkAttr0) values ("29","145.0"); | Success                              |
+| JDBC Session            | conn.setAutoCommit(false);                                   | Success                              |
+| **JDBC Session**        | **PreparedStatement ps = conn.prepareStatement("SELECT * FROM table0 WHERE pkAttr0 IN (?, ?)");<br>ps.setBigDecimal(1, new BigDecimal("3.0"));<br>ps.setBigDecimal(2, new BigDecimal("8.0"));<br>ps.executeQuery();** | **Connection Lost / Server Crash X** |
+
+**Bug Description**
+
+When using a JDBC connection to execute a transaction, if a `PreparedStatement` is used to query a table defined with partitions (specifically `PARTITION BY key()`), and the query condition involves an `IN` clause with at least two parameters on the partition key (e.g., `pkAttr0 IN (?, ?)`), the database connection is unexpectedly dropped. This behavior suggests a potential server crash triggered by the specific combination of prepared statements, `IN` clause evaluation, and partitioning logic.
+
+
+
+#### Bug#36 [Confirmed] JDBC connection broken after deadlock in specific versions
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                               | **State**                                                    |
+| ----------------------- | -------------------------------------------------- | ------------------------------------------------------------ |
+| Schema Creation         | create table t (k integer primary key, v integer); | Success                                                      |
+| Database Initialization | insert into t values(1,1),(2,2);                   | Success                                                      |
+| Session 1               | BEGIN;                                             | Success                                                      |
+| Session 2               | BEGIN;                                             | Success                                                      |
+| Session 1               | update t set v=v+10 where k=1;                     | Success                                                      |
+| Session 2               | update t set v=v+10 where k=2;                     | Success                                                      |
+| Session 1               | update t set v=v+10 where k=2;                     | Blocked (Waiting for Session 2)                              |
+| Session 2               | update t set v=v+10 where k=1;                     | Deadlock found, transaction rolled back (Exception thrown)   |
+| **Session 2**           | **rollback() OR close()**                          | **SQLNonTransientConnectionException: Communications link failure X** |
+
+**Bug Description**
+
+This bug relates to how TDSQL handles JDBC connections after a deadlock occurs. The test case simulates a standard deadlock scenario using two parallel sessions updating records in reverse order.
+
+In TDSQL v2.0 and v3.0, when the deadlock is detected and an exception is thrown for Session 2, the underlying JDBC connection remains valid, allowing the application to execute a `rollback()` or proceed with other operations.
+
+However, in TDSQL v2.5, triggering the deadlock causes the JDBC connection to break entirely. Any subsequent operation on that connection object, including standard error handling routines like `rollback()` or `close()`, results in a `SQLNonTransientConnectionException` or `Communications link failure`. This prevents applications from gracefully recovering from deadlock exceptions.
+
+
+
+#### Bug#37 [Open] Inconsistent update in Read Committed when Primary Key is modified concurrently
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                                         | **State**                                                    |
+| ----------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Global Setting          | set global tdsql_no_range_lock_on_rc = true;                 | Success                                                      |
+| Schema Creation         | create table t (a int , b int,c int, primary key(a,b));<br>alter table t add index ic(c); | Success                                                      |
+| Database Initialization | insert into t values(1,1,null),(1,2,null),(3,3,null);        | Success                                                      |
+| Session 1               | BEGIN;                                                       | Success                                                      |
+| Session 2               | BEGIN;                                                       | Success                                                      |
+| Session 1               | update t set a=2 where b=3;                                  | Success                                                      |
+| Session 2               | update t set a=4 where c is null;                            | Blocked                                                      |
+| Session 1               | Commit;                                                      | Success                                                      |
+| **Session 2**           | **... (Unblocked) -> Commit**                                | **Success (Rows matched: 2, Changed: 2)**                    |
+| **Session 2**           | **select * from t;**                                         | **Returns <2,3,null>,<4,1,null>,<4,2,null>** <br> (Expected: <4,3,null>,<4,1,null>,<4,2,null>) |
+
+**Bug Description**
+
+In Read Committed (RC) isolation level, a transaction may fail to update a row if that row's primary key was concurrently modified by another transaction, even if the row still satisfies the update condition.
+
+In the test case above, Session 2 intends to update all rows where `c is null` (which includes all 3 rows). It first scans the data but gets blocked on the row `<3,3,null>` because Session 1 holds a lock on it. Session 1 modifies the primary key of this row from `<3,3>` to `<2,3>` and commits.
+
+When Session 1 commits, Session 2 resumes. However, because the primary key of the blocked row has changed, Session 2 likely fails to locate or re-fetch the row using the old primary key it originally scanned, resulting in that row being skipped.
+
+TDSQL updates only 2 rows, leaving the row modified by Session 1 as `<2,3,null>` (with `a=2` from Session 1, not `a=4` from Session 2). In contrast, MySQL (in this specific scenario involving a secondary index) correctly updates all 3 rows (`Rows matched: 3`).
+
+*Note: A similar anomaly exists in MySQL when no secondary index is used (MySQL Bug #118923), but the behavior described here for TDSQL occurs even when secondary indexes are present, deviating from standard MySQL behavior.*
+
+
+
+#### Bug#38 [Open] Potential Server Core Dump with complex INSERT/REPLACE sequence
+
+**Test Case**
+
+| **Transaction ID** | **Operation Detail**                                         | **State**               |
+| ------------------ | ------------------------------------------------------------ | ----------------------- |
+| Schema Creation    | DROP DATABASE IF EXISTS database43;<br>CREATE DATABASE database43;<br>USE database43;<br>CREATE TABLE IF NOT EXISTS t0(c0 MEDIUMINT(70) ZEROFILL  COLUMN_FORMAT DEFAULT COMMENT 'asdf'  UNIQUE KEY PRIMARY KEY NOT NULL STORAGE DISK); | Success                 |
+| Data Manipulation  | UPDATE t0 SET c0=INET_ATON((("e") = (NULL)) && (( EXISTS (SELECT 1 WHERE FALSE)) NOT IN (t0.c0))) WHERE (((t0.c0) IS NOT FALSE) <= ((')i') NOT IN (t0.c0, t0.c0, 1341945352))) < ((+ (('h?F*pCHH') IN (0.8245236965404992)))); | Success                 |
+| Data Manipulation  | REPLACE INTO t0(c0) VALUES(1341945352);<br>REPLACE LOW_PRIORITY INTO t0(c0) VALUES(1580004396);<br>INSERT HIGH_PRIORITY INTO t0(c0) VALUES(-1958477645);<br>INSERT INTO t0(c0) VALUES(1341945352);<br>REPLACE INTO t0(c0) VALUES(-781030407), (-1170603897), (2142965007), (-1), (-993046491);<br>REPLACE DELAYED INTO t0(c0) VALUES(233032385), (233032385), (-929048787);<br>REPLACE LOW_PRIORITY INTO t0(c0) VALUES(1184887975);<br>REPLACE DELAYED INTO t0(c0) VALUES(NULL);<br>REPLACE DELAYED INTO t0(c0) VALUES(NULL);<br>INSERT LOW_PRIORITY IGNORE INTO t0(c0) VALUES(-348976803);<br>INSERT INTO t0(c0) VALUES(-993046491);<br>REPLACE LOW_PRIORITY INTO t0(c0) VALUES(1702262481);<br>INSERT HIGH_PRIORITY IGNORE INTO t0(c0) VALUES(-1604196711); | Success                 |
+| **Session 1**      | **INSERT IGNORE INTO t0(c0) VALUES(-1183122001), (2017470206), (1063044896);** | **Core Dump / Crash X** |
+
+**Bug Description**
+
+Executing a specific sequence of SQL statements involving `MEDIUMINT ZEROFILL` columns, complex conditional `UPDATE` statements, and various types of write operations (`REPLACE`, `INSERT`, `DELAYED`, `LOW_PRIORITY`, `IGNORE`) may cause the TDSQL server to core dump (crash).
+
+The crash typically triggers on the final `INSERT IGNORE` statement in the sequence provided above. It is noted that this bug is difficult to reproduce consistently, suggesting it may involve a race condition or a specific memory corruption state triggered by the combination of `ZEROFILL` attributes, storage engine properties, and mixed DML operations.
+
+
+
+#### Bug#39 [Confirmed] Inconsistent data and Primary Key violation after INSERT IGNORE
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                                         | **State**                                                    |
+| ----------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Schema Creation         | DROP TABLE IF EXISTS t0;<br>CREATE TABLE t0(c1 INT  PRIMARY KEY , c0 DATE) ;<br>CREATE INDEX i0 ON t0(c1, c0 ); | Success                                                      |
+| Database Initialization | **INSERT IGNORE INTO t0(c1, c0) VALUES(2, '2025-01-21'), (2, '1742-08-30'), (2, '2026-05-28');** | **Success (2 rows affected, 1 warning) X** <br>(Expected: 1 row affected) |
+| Session 1               | set htap_routing_strategy='default';                         | Success                                                      |
+| **Session 1**           | **select * from t0;**                                        | **Returns 2 rows: (2025-01-21, 2), (2026-05-28, 2) X**       |
+| **Session 1**           | **select count(*) from t0;**                                 | **Returns 1 X**                                              |
+| Session 1               | set htap_routing_strategy='vector_engine';                   | Success                                                      |
+| **Session 1**           | **select * from t0;**                                        | **Returns 1 row: (2026-05-28, 2) X**                         |
+
+**Bug Description**
+
+This bug highlights a violation of the Primary Key uniqueness constraint and inconsistent read results across different execution engines in TDSQL.
+
+The table `t0` has a Primary Key on column `c1`. When executing `INSERT IGNORE` with three records containing the same duplicate key `c1=2`, the database should strictly insert only the first record and discard the others (Standard MySQL behavior results in 1 row: `2025-01-21`).
+
+However, TDSQL exhibits the following anomalies:
+1.  **Constraint Violation**: The `INSERT IGNORE` statement successfully inserts 2 rows, violating the primary key constraint.
+2.  **Inconsistent Reads (Default Engine)**: A simple `SELECT *` scan returns 2 rows (showing duplicate PKs), whereas `SELECT COUNT(*)` returns only 1 row.
+3.  **Engine Discrepancy (Vector Engine)**: When switching to the Vector Engine, `SELECT *` returns 1 row, but it returns the *last* inserted value (`2026-05-28`) instead of the first one (`2025-01-21`).
+
+This issue appears to be specific to tables containing `DATE` and `INT` columns with a secondary covering index (`i0`).
+
+
+
+#### Bug#40 [Confirmed] Transaction implicitly rolled back when JDBC Query Timeout occurs in a Deadlock scenario
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                                         | **State**                                                    |
+| ----------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Schema Creation         | create table table0 (pkId integer, pkAttr0 varchar(10), pkAttr1 varchar(10), coAttr0_0 integer, primary key(pkAttr0, pkAttr1) ) ; | Success                                                      |
+| Database Initialization | insert into table0 values (0,'vc0','vc2',479),(1,'vc7','vc8',646)...; | Success                                                      |
+| Session 1               | BEGIN;                                                       | Success                                                      |
+| Session 2               | BEGIN;                                                       | Success                                                      |
+| Session 1               | update table0 set coAttr0_0 = 347 where ( pkAttr0 = 'vc7' ); | Success (Locks Row A)                                        |
+| Session 2               | insert into table0 (..., pkId=9, pkAttr0='vc45'...) values(...); | Success (Creates Row B)                                      |
+| Session 2               | update table0 set coAttr0_0 = 348 where ( pkAttr0 = 'vc7' ); | Blocked (Waiting for Lock A held by S1)                      |
+| Session 1               | **(JDBC setQueryTimeout = 2s)**<br>select ... from table0 where ( pkId > 5 ) for update; | Blocked (Waiting for Lock B held by S2)                      |
+| **Session 1**           | **... (After 2 seconds)**                                    | **MySQLTimeoutException: Statement cancelled due to timeout** |
+| Session 1               | Commit;                                                      | Success                                                      |
+| Session 1               | select coAttr0_0 ... where pkAttr0 = 'vc7';                  | **Returns 646 (Old Value)** <br>Expected: 347 (Updated Value) |
+
+**Bug Description**
+
+This bug occurs when using the JDBC `setQueryTimeout` method in a concurrency scenario that effectively forms a deadlock.
+
+1.  **Session 1** updates a row (Row A).
+2.  **Session 2** inserts a new row (Row B) and then attempts to update Row A, getting blocked by Session 1.
+3.  **Session 1** attempts to read Row B with `FOR UPDATE`. This forms a circular dependency (Deadlock): Session 1 holds A, wants B; Session 2 holds B, wants A.
+
+If Session 1 has a short query timeout (e.g., 2 seconds) set via JDBC:
+*   **MySQL Behavior**: It typically detects the deadlock immediately and rolls back the victim transaction (usually Session 2), or if the timeout triggers first, it cancels the statement.
+*   **TDSQL Behavior**: Session 1 throws a `MySQLTimeoutException` (Statement cancelled). The application catches this and executes `COMMIT`. However, the data updated by Session 1 earlier (Row A = 347) is **lost**.
+
+This implies that although TDSQL threw a "Timeout" exception to the client, it internally performed a full transaction rollback (likely due to deadlock detection logic interfering with the timeout logic). Since the client received a Timeout exception rather than a Deadlock exception, it assumed the transaction was still valid and committed, leading to an unexpected loss of written data.
+
+
+
+#### Bug#41 [Confirmed] Server crash when parsing PreparedStatement with parameter in subquery projection
+
+**Test Case**
+
+| **Transaction ID** | **Operation Detail**                                         | **State**                                                    |
+| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| JDBC Configuration | URL: `jdbc:mysql://...?useServerPrepStmts=true&cachePrepStmts=true` | Success                                                      |
+| Schema Creation    | drop table if exists table0;<br>create table table0 (k integer, v integer); | Success                                                      |
+| JDBC Session       | PreparedStatement ps = conn.prepareStatement("select * from `table0` where ( `v` = ( select ? ) )"); | Success                                                      |
+| **JDBC Session**   | **ps.setInt(1, 10);<br>ps.executeQuery();**                  | **Communications link failure (Server Crash / Core Dump) X** |
+
+**Bug Description**
+
+When using JDBC with server-side prepared statements (`useServerPrepStmts=true`), executing a query where a parameter placeholder (`?`) appears in the projection of a subquery (e.g., `( select ? )`) causes the TDSQL server to crash (Core Dump).
+
+The client receives a `Communications link failure` exception. The server-side stack trace indicates a segmentation fault in `Protocol_classic::send_field_metadata` -> `__strlen_sse2_pminub`. This suggests that during the `COM_STMT_PREPARE` phase, when the server attempts to send result set metadata back to the client, it encounters a NULL pointer when trying to determine the column name or metadata for the un-typed `?` in the subquery.
+
+This behavior differs from MySQL 8.4.3, which handles this syntax correctly without crashing.
+
+
+
+#### Bug#42 [Confirmed] Server crash during concurrent shared lock reads on partitioned table
+
+**Test Case**
+
+| **Transaction ID**         | **Operation Detail**                                         | **State**                      |
+| -------------------------- | ------------------------------------------------------------ | ------------------------------ |
+| Schema Creation            | drop table if exists table0;<br>create table table0 (k integer, v integer) PARTITION BY key(k) PARTITIONS 10; | Success                        |
+| Database Initialization    | insert into table0 values (7,1),(9,2),(17,3),(21,4),(24,5),(27,6),(31,7),(34,8),(37,9),(41,10); | Success                        |
+| Session 1 & 2 (Concurrent) | **Loop execution (10000 times):**<br>`select v from table0 where ( v = $random_int ) lock in share mode;` | **Server Crash / Core Dump X** |
+
+**Bug Description**
+
+This bug involves a server crash (Signal 11) when executing concurrent read operations with `LOCK IN SHARE MODE` on a partitioned table.
+
+The conditions for reproduction are specific:
+1.  The table must be **partitioned** (e.g., `PARTITION BY key(k)`).
+2.  The query uses **`LOCK IN SHARE MODE`** (tests show that `FOR UPDATE` does not trigger this issue).
+3.  The query filters on a non-partition key column (`v`), likely causing scanning or locking across partitions.
+4.  High concurrency (two or more threads in a loop).
+
+The crash occurs in the transaction locking module, specifically during the unlocking phase. The stack trace points to `rocksdb::TDNewTransLockUnit::UnLockRangeLock_`, causing a segmentation fault. This suggests a race condition or memory corruption when releasing range locks in the pessimistic transaction lock manager (`RequestPessimisticTrxLockManager`) during the commit/cleanup phase (`CommitDone`).
+
+
+
+#### Bug#43 [Confirmed] Unique index violation in Read Committed with concurrent updates
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                                         | **State**                                                    |
+| ----------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Global Setting          | set global tdsql_no_range_lock_on_rc = true;                 | Success                                                      |
+| Schema Creation         | create table t (a double primary key, b double, c double unique, d double);<br>alter table t add index i(d); | Success                                                      |
+| Database Initialization | insert into t values(1,1,1,1),(3,3,3,3);                     | Success                                                      |
+| Session 1               | BEGIN;                                                       | Success                                                      |
+| Session 2               | BEGIN;                                                       | Success                                                      |
+| Session 1               | update t set c=2 where a=1;                                  | Success                                                      |
+| Session 2               | update t set c=2 where d > 2;                                | **Success (Affected 1 row) X** <br>(Expected: Blocked / Error) |
+| Session 1               | Commit;                                                      | Success                                                      |
+| Session 2               | Commit;                                                      | Success                                                      |
+| **Session 2**           | **select * from t;**                                         | **Returns <1,1,2,1>, <3,3,2,3> X** <br> (Duplicate entry '2' for unique column 'c') |
+
+**Bug Description**
+
+In Read Committed (RC) isolation level (with range locks disabled), TDSQL fails to enforce unique constraints under specific concurrent update scenarios involving different access paths (Primary Key vs. Secondary Index).
+
+Transaction 1 updates a row via the primary key, setting the unique column `c` to `2`. Concurrently, Transaction 2 updates a different row (found via secondary index `d`) setting the same unique column `c` to `2`.
+
+In MySQL, Transaction 2 would be blocked waiting for the lock on the unique index entry `2`, and upon Transaction 1's commit, Transaction 2 would fail with `ERROR 1062 (Duplicate entry)`. However, TDSQL allows both transactions to succeed and commit. This results in a corrupted state where two different rows hold the value `2` in column `c`, violating the UNIQUE constraint.
+
+
+
+#### Bug#44 [Confirmed] Transaction forced to rollback after Duplicate Entry error in multi-row insert
+
+**Test Case**
+
+| **Transaction ID** | **Operation Detail**                 | **State**                                                    |
+| ------------------ | ------------------------------------ | ------------------------------------------------------------ |
+| Schema Creation    | create table t (a int key, b int);   | Success                                                      |
+| Session 1          | Begin;                               | Success                                                      |
+| Session 1          | insert into t values(10,10);         | Success                                                      |
+| Session 1          | insert into t values(20,10),(20,20); | Error 1062: Duplicate entry '20' for key 't.PRIMARY'         |
+| **Session 1**      | **Commit;**                          | **Error: Transaction must be aborted X** <br> (MySQL: Success) |
+| **Session 1**      | **Rollback;**                        | **Success (Data (10,10) is lost)**                           |
+
+**Bug Description**
+
+This bug represents a compatibility issue regarding error handling within a transaction.
+
+In MySQL, if a specific SQL statement fails (e.g., a multi-row insert violating a Unique constraint), only that statement is rolled back (Statement-level Rollback). The transaction remains active, and previous successful operations (like the first `insert` in this case) can still be committed.
+
+In TDSQL, triggering a duplicate entry error during a multi-row insert causes the entire transaction to be marked as "aborted". Any subsequent attempt to `COMMIT` fails with "Transaction must be aborted," forcing the user to `ROLLBACK` the entire transaction. This leads to the loss of valid data (`10,10`) that was successfully inserted earlier in the transaction.
+
+
+
+#### Bug#45 [Confirmed] Deadlock and Timeout during concurrent ADD INDEX and Transactions on partitioned table
+
+**Test Case**
+
+| **Transaction ID**       | **Operation Detail**                                         | **State**                                                    |
+| ------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Schema Creation          | create table table1 (pkId integer, pkAttr0 integer, col double(10,2), primary key(pkAttr0)) PARTITION BY HASH(pkAttr0)  PARTITIONS 4 ; | Success                                                      |
+| **Concurrent Execution** | **Execute the following three sessions in parallel:**        |                                                              |
+| Session 1 (DDL)          | alter table table1 add index idx1(col);                      | **Blocked -> Lock wait timeout exceeded X**                  |
+| Session 2 (Read Txn)     | begin;<br>select pkId from table1 where col = 55722.0;<br>commit; | Success                                                      |
+| Session 3 (Write Txn)    | begin;<br>update table1 set col = 90 where ( pkAttr0  =  28  );<br>commit; | **Blocked -> Internal Error: resp.regions_meta is invalid X** |
+
+**Bug Description**
+
+On a partitioned table (even if empty), executing an `ALTER TABLE ... ADD INDEX` operation concurrently with specific Read and Write transactions leads to a deadlock-like hang, eventually causing the DDL to timeout and the transaction to fail.
+
+The scenario requires three concurrent operations:
+1.  An `ADD INDEX` DDL operation.
+2.  A Transaction performing a `SELECT` based on the column being indexed.
+3.  A Transaction performing an `UPDATE` based on the primary key.
+
+While the Read transaction (Session 2) typically completes, the DDL (Session 1) and the Write transaction (Session 3) block each other.
+*   **Session 1** eventually fails with: `Lock wait timeout exceeded; try restarting transaction.`
+*   **Session 3** fails with an internal engine error: `[SQLEngine] resp.regions_meta is invalid`.
+
+Inspection of `sys.x$schema_table_lock_waits` shows the DDL waiting for an `EXCLUSIVE` lock but being blocked by `SHARED` locks, suggesting a Metadata Lock (MDL) conflict or an internal resource deadlock within the partitioning engine.
+
+
+
+#### Bug#46 [Confirmed] Inconsistent query results between Unique and Non-Unique indexes after concurrent PK update
+
+**Test Case**
+
+| **Transaction ID**       | **Operation Detail**                                       | **State**                           |
+| ------------------------ | ---------------------------------------------------------- | ----------------------------------- |
+| Schema Creation (Case A) | create table test (a int,b int, primary key(a),unique(b)); | Success                             |
+| Schema Creation (Case B) | create table test (a int,b int, primary key(a),key(b));    | Success                             |
+| Database Initialization  | insert into test values(1,1);                              | Success                             |
+| Session 1                | BEGIN;                                                     | Success                             |
+| Session 1                | select * from test;                                        | Success                             |
+| Session 2                | update test set a = 2; (and Commit)                        | Success                             |
+| Session 1                | update test set a=3 where a=2;                             | Success                             |
+| **Session 1 (Case A)**   | **select * from test where b = 1;**                        | **Returns <1,1> (1 row)**           |
+| **Session 1 (Case A)**   | **select * from test where b >= 1;**                       | **Returns <1,1>, <3,1> (2 rows) X** |
+| **Session 1 (Case B)**   | **select * from test where b = 1;**                        | **Returns <1,1>, <3,1> (2 rows)**   |
+| **Session 1 (Case B)**   | **select * from test where b >= 1;**                       | **Returns <1,1>, <3,1> (2 rows)**   |
+
+**Bug Description**
+
+This bug reveals an inconsistency in query results depending on whether a secondary index is defined as `UNIQUE` or not, specifically after a concurrent transaction modifies the Primary Key.
+
+The scenario involves Transaction 1 starting, then Transaction 2 updates the Primary Key of a row from 1 to 2. Subsequently, Transaction 1 updates that *same* row (using the new PK 2) to a new PK 3.
+
+*   **Case A (Unique Index on `b`)**:
+    *   A point query (`b=1`) returns only the old version `<1,1>`.
+    *   A range query (`b>=1`) returns **both** the old version `<1,1>` and the newly updated version `<3,1>`. This internal inconsistency (Point scan vs. Range scan) suggests an issue with how unique index lookups handle visibility in the write-set of the current transaction combined with history versions.
+
+*   **Case B (Non-Unique Index on `b`)**:
+    *   Both point and range queries return duplicate versions `<1,1>` and `<3,1>`.
+
+While returning both versions (Ghost Rows) might be an anomaly in itself (violating standard snapshot visibility where one should arguably see the latest state of the transaction), the fact that **Unique Index** behaves inconsistently between point and range selects makes this a distinct bug.
+
+
+
+#### Bug#47 [Confirmed] Non-deterministic read results in repeated transactions with Partition Key updates
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                                         | **State**                                                    |
+| ----------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Schema Creation         | CREATE TABLE tbl_1 (col_1_1 INT, col_1_4 INT, pkid_1 INT) PARTITION BY RANGE (col_1_1) SUBPARTITION BY HASH (col_1_1) (PARTITION p0 VALUES LESS THAN (2) (SUBPARTITION s0, SUBPARTITION s1), PARTITION p1 VALUES LESS THAN (4) (SUBPARTITION s2, SUBPARTITION s3)); | Success                                                      |
+| Database Initialization | INSERT INTO tbl_1 (col_1_4, pkid_1, col_1_1) VALUES (1, 2, 1);<br>INSERT INTO tbl_1 (col_1_4, pkid_1, col_1_1) VALUES (1, 3, 0); | Success                                                      |
+| **Transaction 1**       | BEGIN;                                                       | Success                                                      |
+| Transaction 1           | DELETE FROM tbl_1 WHERE (tbl_1.col_1_4 < 1 );                | Success (0 rows affected)                                    |
+| Transaction 1           | UPDATE tbl_1 SET tbl_1.col_1_4 = 0, tbl_1.col_1_1 = 0 WHERE tbl_1.col_1_1 > 0; | Success (Updates Row 1: col_1_1 changes 1->0, col_1_4 changes 1->0) |
+| **Transaction 1**       | **SELECT tbl_1.col_1_4, tbl_1.pkid_1 FROM tbl_1 WHERE tbl_1.col_1_4 = 1;** | **Returns (1,3), (1,2) X** <br> (Row (1,2) should not match because col_1_4 became 0) |
+| Transaction 1           | ROLLBACK;                                                    | Success                                                      |
+| **Transaction 2**       | BEGIN;                                                       | Success                                                      |
+| Transaction 2           | DELETE FROM tbl_1 WHERE (tbl_1.col_1_4 < 1 );                | Success                                                      |
+| Transaction 2           | UPDATE tbl_1 SET tbl_1.col_1_4 = 0, tbl_1.col_1_1 = 0 WHERE tbl_1.col_1_1 > 0; | Success                                                      |
+| **Transaction 2**       | **SELECT tbl_1.col_1_4, tbl_1.pkid_1 FROM tbl_1 WHERE tbl_1.col_1_4 = 1;** | **Returns (1,3)** <br> (Correct result)                      |
+| Transaction 2           | ROLLBACK;                                                    | Success                                                      |
+
+**Bug Description**
+
+This bug demonstrates inconsistent read behavior when executing the exact same transaction logic twice, separated by a rollback.
+
+The transaction performs an `UPDATE` that modifies the Partition Key (`col_1_1`) and another column (`col_1_4`) of a row.
+1.  **First Execution**: The subsequent `SELECT` query incorrectly returns the old version of the updated row (`1,2`), even though `col_1_4` was updated to 0 (which should result in the row being filtered out). This suggests the query in the first transaction failed to see the effects of its own partition-key update.
+2.  **Second Execution**: After rolling back and retrying the exact same operations, the `SELECT` query correctly returns only the non-updated row (`1,3`).
+
+Since the first transaction was rolled back, the database state should be identical for the start of the second transaction. The difference in results indicates a state contamination or caching issue related to Partition Key updates within the engine.
+
+
+
+#### Bug#48 [Confirmed] Ghost rows returned when updating Partition Key in transaction
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                                         | **State**                                                    |
+| ----------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Schema Creation         | DROP TABLE IF EXISTS tbl_1;<br>CREATE TABLE tbl_1 (col_1_1 INT, col_1_2 INT, pkid_1 INT, PRIMARY KEY idx_1_1 (col_1_1, col_1_2)) PARTITION BY HASH (col_1_2) PARTITIONS 4; | Success                                                      |
+| Database Initialization | INSERT INTO tbl_1 (col_1_1, col_1_2, pkid_1) VALUES (0, 0, 0); | Success                                                      |
+| Session 1               | BEGIN;                                                       | Success                                                      |
+| Session 1               | DELETE FROM tbl_1 WHERE ((tbl_1.col_1_2 = -1));              | Success (0 rows affected)                                    |
+| Session 1               | UPDATE tbl_1 SET tbl_1.col_1_1 = -1, tbl_1.col_1_2 = -1 WHERE tbl_1.col_1_2 = 0; | Success (Updates partition key)                              |
+| **Session 1**           | **SELECT * FROM tbl_1;**                                     | **Returns 2 rows: (0,0,0) and (-1,-1,0) X** <br> (Expected: Only (-1,-1,0)) |
+| Session 1               | COMMIT;                                                      | Success                                                      |
+| Session 1               | SELECT * FROM tbl_1;                                         | Returns 1 row: (-1,-1,0)                                     |
+
+**Bug Description**
+
+In a partitioned table, updating a row's partition key (which involves moving data across partitions or logical delete+insert) causes a subsequent query within the same transaction to return duplicate versions of the same row: the old version (before update) and the new version (after update).
+
+This anomaly is triggered only if the `UPDATE` is preceded by a `DELETE` statement (even if that delete affects 0 rows). This suggests a defect in how the transaction write-set or cursor visibility is handled during partition key updates when combined with previous write intentions in the same transaction. The issue disappears after the transaction is committed.
+
+
+
+#### Bug#49 [Confirmed] Inconsistent visibility of "no-op" updates in Repeatable Read isolation
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                   | **State**                                                    |
+| ----------------------- | -------------------------------------- | ------------------------------------------------------------ |
+| Schema Creation         | create table t (id int, a int);        | Success                                                      |
+| Database Initialization | insert into t values(1,2),(2,2),(3,3); | Success                                                      |
+| Session 1               | BEGIN;                                 | Success                                                      |
+| Session 1               | select * from t;                       | Returns (1,2), (2,2), (3,3)                                  |
+| Session 2               | update t set a=a+1;                    | Success (Rows: 3, Changed: 3)<br>Data becomes (1,3), (2,3), (3,4) |
+| Session 1               | update t set a=3;                      | Success (Rows matched: 3, **Changed: 1**)<br>Row 1 & 2 are already 3, so optimization skips them. Row 3 changes 4->3. |
+| **Session 1**           | **select * from t;**                   | **Returns (1,3), (2,2), (3,3) X**                            |
+| Session 1               | Commit;                                | Success                                                      |
+| Session 1               | select * from t;                       | Returns (1,3), (2,3), (3,3)                                  |
+
+**Bug Description**
+
+This bug highlights an inconsistency in how "no-op" updates (updates where the new value equals the old value) affect data visibility within a Repeatable Read transaction.
+
+1.  **Context**: Session 1 starts and views a snapshot. Session 2 updates all rows to `a+1` (Row 1: `2->3`, Row 2: `2->3`, Row 3: `3->4`).
+2.  **The Trigger**: Session 1 attempts to update `a=3`.
+    *   For Row 1 (`a` is 3) and Row 2 (`a` is 3), the value matches the target. The engine optimizes this by not performing a physical update (`Changed: 0` for these rows).
+    *   For Row 3 (`a` is 4), the value changes to 3 (`Changed: 1`).
+3.  **The Anomaly**: When Session 1 selects the data again:
+    *   **MySQL Behavior**: It returns the *snapshot* version for rows that were not physically changed by the transaction (Row 1: `2`, Row 2: `2`) and the *new* version for the row that was changed (Row 3: `3`).
+    *   **TDSQL Behavior**: It acts inconsistently. It returns the **new** version for Row 1 (`3`), but the **snapshot** version for Row 2 (`2`). Both rows were treated identically by the logic (skipped updates), yet they exhibit different visibility rules. This randomness indicates a bug in how the read view interacts with skipped update optimizations.
+
+
+
+#### Bug#50 [Confirmed] Skipped Snapshot Creation due to "Impossible WHERE" optimization in Repeatable Read
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                                      | **State**                                                    |
+| ----------------------- | --------------------------------------------------------- | ------------------------------------------------------------ |
+| Schema Creation         | create table t1(a int);<br>alter table t1 add index i(a); | Success                                                      |
+| Database Initialization | (Table t1 is empty)                                       | Success                                                      |
+| Session 1               | BEGIN;                                                    | Success                                                      |
+| Session 2               | BEGIN;                                                    | Success                                                      |
+| Session 1               | insert into t1 values(1);                                 | Success                                                      |
+| **Session 2**           | **select * from t1 where a = null;**                      | **Success (Empty set)** <br> *(Trigger: Query optimization detects "Impossible WHERE" and skips execution/snapshot creation)* |
+| Session 1               | Commit;                                                   | Success                                                      |
+| **Session 2**           | **select * from t1;**                                     | **Returns (1) X** <br> (Expected: Empty set, due to Repeatable Read) |
+
+**Bug Description**
+
+In Repeatable Read isolation level, the first read operation in a transaction should establish a consistent snapshot. However, if that first read query contains a condition that is statically determined to be impossible (e.g., `a = null` which is always False in SQL, vs `a is null`), the database engine optimizes the execution by directly returning an empty set without actually accessing the storage engine or creating a transaction read view (snapshot).
+
+Consequently, when the transaction executes a second query later, it creates the snapshot *at that moment*. If another transaction (Session 1) has committed data in the interim, this delayed snapshot creation causes the current transaction (Session 2) to see data committed *after* its logical start, violating the expected Repeatable Read behavior.
+
+This issue requires an index on the column used in the `WHERE` clause to trigger the specific optimization path. While present in MySQL 8.0/8.4, it is also observed in TDSQL, differing from systems like TiDB which handle this correctly.
+
+
+
+#### Bug#51 [Confirmed] Deadlock between DML transaction and Partition DDL operations
+
+**Test Case**
+
+| **Transaction ID** | **Operation Detail**                                         | **State**                                                    |
+| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Schema Creation    | drop table if exists table0;<br>create table table0 (pkId integer, pkAttr0 integer, commonAttr0_0 integer, commonAttr1_0 varchar(10), commonAttr2_0 double(10, 2), commonAttr3_0 varchar(10), commonAttr4_0 varchar(10), primary key(pkAttr0)) ROW_FORMAT = DYNAMIC  PARTITION BY KEY(pkAttr0)  PARTITIONS 4 ; | Success                                                      |
+| Session 1          | BEGIN;                                                       | Success                                                      |
+| Session 1          | select `pkId`, `commonAttr4_0`, `pkAttr0` from `table0` where ( `pkAttr0`  =  77  )  ; | Success                                                      |
+| Session 2          | **alter table table0 coalesce partition 1;**                 | **Blocked (Waiting for metadata lock held by S1)**           |
+| **Session 1**      | **update `table0` set `commonAttr1_0` = "CLf"... where (`pkAttr0`  =  132  );** | **ERROR 1213 (40001): Deadlock found when trying to get lock X** |
+
+**Bug Description**
+
+This bug manifests as a deadlock when a DML transaction runs concurrently with specific partition-related DDL operations on the same table.
+
+1.  **Session 1** starts a transaction and performs a read operation (`SELECT`), acquiring a shared metadata lock (MDL) on the table.
+2.  **Session 2** attempts a partition DDL (e.g., `COALESCE PARTITION`, `REORGANIZE PARTITION`, or `ADD PARTITION`). This requires an exclusive lock and is blocked by Session 1.
+3.  **Session 1** proceeds to perform an `UPDATE` on the same table.
+
+Instead of simply being blocked or successfully executing (depending on the exact lock compatibility), Session 1 immediately fails with a Deadlock error. This suggests a conflict in the wait graph between the DML locks and the pending Partition DDL locks. This behavior is also reproducible in MySQL (Bug #117735), but in TDSQL, the deadlock cycle is difficult to trace in the transaction logs.
