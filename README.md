@@ -1,8 +1,8 @@
 # Bugs found in Database Management Systems
 
-We have successfully discovered 51 bugs (16 fixed, 42 confirmed and 9 open reported) from real-world production-level DBMSs, including 5 bugs in MySQL, 2 bugs in PostgreSQL, 19 bugs in TiDB, 3 bugs in OpenGauss, 3 bugs in Oceanbase, and 19 bugs in TDSQL.
+We have successfully discovered 49 bugs (26 fixed, 39 confirmed and 10 open reported) from real-world production-level DBMSs, including 5 bugs in MySQL, 2 bugs in PostgreSQL, 20 bugs in TiDB, 3 bugs in OpenGauss, 3 bugs in Oceanbase, and 16 bugs in DB-X.
 
-We are thankful to the DBMS developers for responding to our bug reports and fixing the bugs that we found. Because the nondeterministic interleavings among operations challenges the reproducibility of the isolation-related bugs, there are 9 bugs can not be reproduced but open reported. In the future, we will aim to the research question about reproducing an isolation-related bug.
+We are thankful to the DBMS developers for responding to our bug reports and fixing the bugs that we found. Because the nondeterministic interleavings among operations challenges the reproducibility of the isolation-related bugs, there are 10 bugs can not be reproduced but open reported. In the future, we will aim to the research question about reproducing an isolation-related bug.
 
 We have anonymized the corresponding issue and other personal information due to the double-blind reviewing constraint.
 
@@ -609,7 +609,9 @@ It is because OpenGauss is designed to get snapshot at the first non-transaction
 
 
 
-## TDSQL
+## DB-X
+
+### Isolation-related bugs
 
 #### Bug#24 Server Crash in deadlock scenario involving partitioned table
 
@@ -693,11 +695,11 @@ When using a JDBC connection to execute a transaction, if a `PreparedStatement` 
 
 **Bug Description**
 
-This bug relates to how TDSQL handles JDBC connections after a deadlock occurs. The test case simulates a standard deadlock scenario using two parallel sessions updating records in reverse order.
+This bug relates to how DB-X handles JDBC connections after a deadlock occurs. The test case simulates a standard deadlock scenario using two parallel sessions updating records in reverse order.
 
-In TDSQL v2.0 and v3.0, when the deadlock is detected and an exception is thrown for Session 2, the underlying JDBC connection remains valid, allowing the application to execute a `rollback()` or proceed with other operations.
+In DB-X v2.0 and v3.0, when the deadlock is detected and an exception is thrown for Session 2, the underlying JDBC connection remains valid, allowing the application to execute a `rollback()` or proceed with other operations.
 
-However, in TDSQL v2.5, triggering the deadlock causes the JDBC connection to break entirely. Any subsequent operation on that connection object, including standard error handling routines like `rollback()` or `close()`, results in a `SQLNonTransientConnectionException` or `Communications link failure`. This prevents applications from gracefully recovering from deadlock exceptions.
+However, in DB-X v2.5, triggering the deadlock causes the JDBC connection to break entirely. Any subsequent operation on that connection object, including standard error handling routines like `rollback()` or `close()`, results in a `SQLNonTransientConnectionException` or `Communications link failure`. This prevents applications from gracefully recovering from deadlock exceptions.
 
 
 
@@ -707,7 +709,7 @@ However, in TDSQL v2.5, triggering the deadlock causes the JDBC connection to br
 
 | **Transaction ID**      | **Operation Detail**                                         | **State**                                                    |
 | ----------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| Global Setting          | set global tdsql_no_range_lock_on_rc = true;                 | Success                                                      |
+| Global Setting          | set global DB-X_no_range_lock_on_rc = true;                  | Success                                                      |
 | Schema Creation         | create table t (a int , b int,c int, primary key(a,b));<br>alter table t add index ic(c); | Success                                                      |
 | Database Initialization | insert into t values(1,1,null),(1,2,null),(3,3,null);        | Success                                                      |
 | Session 1               | BEGIN;                                                       | Success                                                      |
@@ -726,9 +728,9 @@ In the test case above, Session 2 intends to update all rows where `c is null` (
 
 When Session 1 commits, Session 2 resumes. However, because the primary key of the blocked row has changed, Session 2 likely fails to locate or re-fetch the row using the old primary key it originally scanned, resulting in that row being skipped.
 
-TDSQL updates only 2 rows, leaving the row modified by Session 1 as `<2,3,null>` (with `a=2` from Session 1, not `a=4` from Session 2). In contrast, MySQL (in this specific scenario involving a secondary index) correctly updates all 3 rows (`Rows matched: 3`).
+DB-X updates only 2 rows, leaving the row modified by Session 1 as `<2,3,null>` (with `a=2` from Session 1, not `a=4` from Session 2). In contrast, MySQL (in this specific scenario involving a secondary index) correctly updates all 3 rows (`Rows matched: 3`).
 
-*Note: A similar anomaly exists in MySQL when no secondary index is used (MySQL Bug #118923), but the behavior described here for TDSQL occurs even when secondary indexes are present, deviating from standard MySQL behavior.*
+*Note: A similar anomaly exists in MySQL when no secondary index is used (MySQL Bug #118923), but the behavior described here for DB-X occurs even when secondary indexes are present, deviating from standard MySQL behavior.*
 
 
 
@@ -745,7 +747,7 @@ TDSQL updates only 2 rows, leaving the row modified by Session 1 as `<2,3,null>`
 
 **Bug Description**
 
-Executing a specific sequence of SQL statements involving `MEDIUMINT ZEROFILL` columns, complex conditional `UPDATE` statements, and various types of write operations (`REPLACE`, `INSERT`, `DELAYED`, `LOW_PRIORITY`, `IGNORE`) may cause the TDSQL server to core dump (crash).
+Executing a specific sequence of SQL statements involving `MEDIUMINT ZEROFILL` columns, complex conditional `UPDATE` statements, and various types of write operations (`REPLACE`, `INSERT`, `DELAYED`, `LOW_PRIORITY`, `IGNORE`) may cause the DB-X server to core dump (crash).
 
 The crash typically triggers on the final `INSERT IGNORE` statement in the sequence provided above. It is noted that this bug is difficult to reproduce consistently, suggesting it may involve a race condition or a specific memory corruption state triggered by the combination of `ZEROFILL` attributes, storage engine properties, and mixed DML operations.
 
@@ -767,11 +769,11 @@ The crash typically triggers on the final `INSERT IGNORE` statement in the seque
 
 **Bug Description**
 
-This bug highlights a violation of the Primary Key uniqueness constraint and inconsistent read results across different execution engines in TDSQL.
+This bug highlights a violation of the Primary Key uniqueness constraint and inconsistent read results across different execution engines in DB-X.
 
 The table `t0` has a Primary Key on column `c1`. When executing `INSERT IGNORE` with three records containing the same duplicate key `c1=2`, the database should strictly insert only the first record and discard the others (Standard MySQL behavior results in 1 row: `2025-01-21`).
 
-However, TDSQL exhibits the following anomalies:
+However, DB-X exhibits the following anomalies:
 
 1.  **Constraint Violation**: The `INSERT IGNORE` statement successfully inserts 2 rows, violating the primary key constraint.
 2.  **Inconsistent Reads (Default Engine)**: A simple `SELECT *` scan returns 2 rows (showing duplicate PKs), whereas `SELECT COUNT(*)` returns only 1 row.
@@ -810,9 +812,9 @@ This bug occurs when using the JDBC `setQueryTimeout` method in a concurrency sc
 If Session 1 has a short query timeout (e.g., 2 seconds) set via JDBC:
 
 *   **MySQL Behavior**: It typically detects the deadlock immediately and rolls back the victim transaction (usually Session 2), or if the timeout triggers first, it cancels the statement.
-*   **TDSQL Behavior**: Session 1 throws a `MySQLTimeoutException` (Statement cancelled). The application catches this and executes `COMMIT`. However, the data updated by Session 1 earlier (Row A = 347) is **lost**.
+*   **DB-X Behavior**: Session 1 throws a `MySQLTimeoutException` (Statement cancelled). The application catches this and executes `COMMIT`. However, the data updated by Session 1 earlier (Row A = 347) is **lost**.
 
-This implies that although TDSQL threw a "Timeout" exception to the client, it internally performed a full transaction rollback (likely due to deadlock detection logic interfering with the timeout logic). Since the client received a Timeout exception rather than a Deadlock exception, it assumed the transaction was still valid and committed, leading to an unexpected loss of written data.
+This implies that although DB-X threw a "Timeout" exception to the client, it internally performed a full transaction rollback (likely due to deadlock detection logic interfering with the timeout logic). Since the client received a Timeout exception rather than a Deadlock exception, it assumed the transaction was still valid and committed, leading to an unexpected loss of written data.
 
 
 
@@ -829,7 +831,7 @@ This implies that although TDSQL threw a "Timeout" exception to the client, it i
 
 **Bug Description**
 
-When using JDBC with server-side prepared statements (`useServerPrepStmts=true`), executing a query where a parameter placeholder (`?`) appears in the projection of a subquery (e.g., `( select ? )`) causes the TDSQL server to crash (Core Dump).
+When using JDBC with server-side prepared statements (`useServerPrepStmts=true`), executing a query where a parameter placeholder (`?`) appears in the projection of a subquery (e.g., `( select ? )`) causes the DB-X server to crash (Core Dump).
 
 The client receives a `Communications link failure` exception. The server-side stack trace indicates a segmentation fault in `Protocol_classic::send_field_metadata` -> `__strlen_sse2_pminub`. This suggests that during the `COM_STMT_PREPARE` phase, when the server attempts to send result set metadata back to the client, it encounters a NULL pointer when trying to determine the column name or metadata for the un-typed `?` in the subquery.
 
@@ -837,38 +839,13 @@ This behavior differs from MySQL 8.4.3, which handles this syntax correctly with
 
 
 
-#### Bug#33 Server crash during concurrent shared lock reads on partitioned table
-
-**Test Case**
-
-| **Transaction ID**         | **Operation Detail**                                         | **State**                      |
-| -------------------------- | ------------------------------------------------------------ | ------------------------------ |
-| Schema Creation            | drop table if exists table0;<br>create table table0 (k integer, v integer) PARTITION BY key(k) PARTITIONS 10; | Success                        |
-| Database Initialization    | insert into table0 values (7,1),(9,2),(17,3),(21,4),(24,5),(27,6),(31,7),(34,8),(37,9),(41,10); | Success                        |
-| Session 1 & 2 (Concurrent) | **Loop execution (10000 times):**<br>`select v from table0 where ( v = $random_int ) lock in share mode;` | **Server Crash / Core Dump X** |
-
-**Bug Description**
-
-This bug involves a server crash (Signal 11) when executing concurrent read operations with `LOCK IN SHARE MODE` on a partitioned table.
-
-The conditions for reproduction are specific:
-
-1.  The table must be **partitioned** (e.g., `PARTITION BY key(k)`).
-2.  The query uses **`LOCK IN SHARE MODE`** (tests show that `FOR UPDATE` does not trigger this issue).
-3.  The query filters on a non-partition key column (`v`), likely causing scanning or locking across partitions.
-4.  High concurrency (two or more threads in a loop).
-
-The crash occurs in the transaction locking module, specifically during the unlocking phase. The stack trace points to `rocksdb::TDNewTransLockUnit::UnLockRangeLock_`, causing a segmentation fault. This suggests a race condition or memory corruption when releasing range locks in the pessimistic transaction lock manager (`RequestPessimisticTrxLockManager`) during the commit/cleanup phase (`CommitDone`).
-
-
-
-#### Bug#34 Unique index violation in Read Committed with concurrent updates
+#### Bug#33 Unique index violation in Read Committed with concurrent updates
 
 **Test Case**
 
 | **Transaction ID**      | **Operation Detail**                                         | **State**                                                    |
 | ----------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| Global Setting          | set global tdsql_no_range_lock_on_rc = true;                 | Success                                                      |
+| Global Setting          | set global DB-X_no_range_lock_on_rc = true;                  | Success                                                      |
 | Schema Creation         | create table t (a double primary key, b double, c double unique, d double);<br>alter table t add index i(d); | Success                                                      |
 | Database Initialization | insert into t values(1,1,1,1),(3,3,3,3);                     | Success                                                      |
 | Session 1               | BEGIN;                                                       | Success                                                      |
@@ -881,69 +858,17 @@ The crash occurs in the transaction locking module, specifically during the unlo
 
 **Bug Description**
 
-In Read Committed (RC) isolation level (with range locks disabled), TDSQL fails to enforce unique constraints under specific concurrent update scenarios involving different access paths (Primary Key vs. Secondary Index).
+In Read Committed (RC) isolation level (with range locks disabled), DB-X fails to enforce unique constraints under specific concurrent update scenarios involving different access paths (Primary Key vs. Secondary Index).
 
 Transaction 1 updates a row via the primary key, setting the unique column `c` to `2`. Concurrently, Transaction 2 updates a different row (found via secondary index `d`) setting the same unique column `c` to `2`.
 
-In MySQL, Transaction 2 would be blocked waiting for the lock on the unique index entry `2`, and upon Transaction 1's commit, Transaction 2 would fail with `ERROR 1062 (Duplicate entry)`. However, TDSQL allows both transactions to succeed and commit. This results in a corrupted state where two different rows hold the value `2` in column `c`, violating the UNIQUE constraint.
+In MySQL, Transaction 2 would be blocked waiting for the lock on the unique index entry `2`, and upon Transaction 1's commit, Transaction 2 would fail with `ERROR 1062 (Duplicate entry)`. However, DB-X allows both transactions to succeed and commit. This results in a corrupted state where two different rows hold the value `2` in column `c`, violating the UNIQUE constraint.
 
 
 
-#### Bug#35 Transaction forced to rollback after Duplicate Entry error in multi-row insert
-
-**Test Case**
-
-| **Transaction ID** | **Operation Detail**                 | **State**                                                    |
-| ------------------ | ------------------------------------ | ------------------------------------------------------------ |
-| Schema Creation    | create table t (a int key, b int);   | Success                                                      |
-| Session 1          | Begin;                               | Success                                                      |
-| Session 1          | insert into t values(10,10);         | Success                                                      |
-| Session 1          | insert into t values(20,10),(20,20); | Error 1062: Duplicate entry '20' for key 't.PRIMARY'         |
-| **Session 1**      | **Commit;**                          | **Error: Transaction must be aborted X** <br> (MySQL: Success) |
-| **Session 1**      | **Rollback;**                        | **Success (Data (10,10) is lost)**                           |
-
-**Bug Description**
-
-This bug represents a compatibility issue regarding error handling within a transaction.
-
-In MySQL, if a specific SQL statement fails (e.g., a multi-row insert violating a Unique constraint), only that statement is rolled back (Statement-level Rollback). The transaction remains active, and previous successful operations (like the first `insert` in this case) can still be committed.
-
-In TDSQL, triggering a duplicate entry error during a multi-row insert causes the entire transaction to be marked as "aborted". Any subsequent attempt to `COMMIT` fails with "Transaction must be aborted," forcing the user to `ROLLBACK` the entire transaction. This leads to the loss of valid data (`10,10`) that was successfully inserted earlier in the transaction.
 
 
-
-#### Bug#36 Deadlock and Timeout during concurrent ADD INDEX and Transactions on partitioned table
-
-**Test Case**
-
-| **Transaction ID**       | **Operation Detail**                                         | **State**                                                    |
-| ------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| Schema Creation          | create table table1 (pkId integer, pkAttr0 integer, col double(10,2), primary key(pkAttr0)) PARTITION BY HASH(pkAttr0)  PARTITIONS 4 ; | Success                                                      |
-| **Concurrent Execution** | **Execute the following three sessions in parallel:**        |                                                              |
-| Session 1 (DDL)          | alter table table1 add index idx1(col);                      | **Blocked -> Lock wait timeout exceeded X**                  |
-| Session 2 (Read Txn)     | begin;<br>select pkId from table1 where col = 55722.0;<br>commit; | Success                                                      |
-| Session 3 (Write Txn)    | begin;<br>update table1 set col = 90 where ( pkAttr0  =  28  );<br>commit; | **Blocked -> Internal Error: resp.regions_meta is invalid X** |
-
-**Bug Description**
-
-On a partitioned table (even if empty), executing an `ALTER TABLE ... ADD INDEX` operation concurrently with specific Read and Write transactions leads to a deadlock-like hang, eventually causing the DDL to timeout and the transaction to fail.
-
-The scenario requires three concurrent operations:
-
-1.  An `ADD INDEX` DDL operation.
-2.  A Transaction performing a `SELECT` based on the column being indexed.
-3.  A Transaction performing an `UPDATE` based on the primary key.
-
-While the Read transaction (Session 2) typically completes, the DDL (Session 1) and the Write transaction (Session 3) block each other.
-
-*   **Session 1** eventually fails with: `Lock wait timeout exceeded; try restarting transaction.`
-*   **Session 3** fails with an internal engine error: `[SQLEngine] resp.regions_meta is invalid`.
-
-Inspection of `sys.x$schema_table_lock_waits` shows the DDL waiting for an `EXCLUSIVE` lock but being blocked by `SHARED` locks, suggesting a Metadata Lock (MDL) conflict or an internal resource deadlock within the partitioning engine.
-
-
-
-#### Bug#37 Inconsistent query results between Unique and Non-Unique indexes after concurrent PK update
+#### Bug#34 Inconsistent query results between Unique and Non-Unique indexes after concurrent PK update
 
 **Test Case**
 
@@ -978,7 +903,7 @@ While returning both versions (Ghost Rows) might be an anomaly in itself (violat
 
 
 
-#### Bug#38 Non-deterministic read results in repeated transactions with Partition Key updates
+#### Bug#35 Non-deterministic read results in repeated transactions with Partition Key updates
 
 **Test Case**
 
@@ -1010,7 +935,7 @@ Since the first transaction was rolled back, the database state should be identi
 
 
 
-#### Bug#39 Ghost rows returned when updating Partition Key in transaction
+#### Bug#36 Ghost rows returned when updating Partition Key in transaction
 
 **Test Case**
 
@@ -1033,7 +958,7 @@ This anomaly is triggered only if the `UPDATE` is preceded by a `DELETE` stateme
 
 
 
-#### Bug#40 Inconsistent visibility of "no-op" updates in Repeatable Read isolation
+#### Bug#37 Inconsistent visibility of "no-op" updates in Repeatable Read isolation
 
 **Test Case**
 
@@ -1059,11 +984,11 @@ This bug highlights an inconsistency in how "no-op" updates (updates where the n
     *   For Row 3 (`a` is 4), the value changes to 3 (`Changed: 1`).
 3.  **The Anomaly**: When Session 1 selects the data again:
     *   **MySQL Behavior**: It returns the *snapshot* version for rows that were not physically changed by the transaction (Row 1: `2`, Row 2: `2`) and the *new* version for the row that was changed (Row 3: `3`).
-    *   **TDSQL Behavior**: It acts inconsistently. It returns the **new** version for Row 1 (`3`), but the **snapshot** version for Row 2 (`2`). Both rows were treated identically by the logic (skipped updates), yet they exhibit different visibility rules. This randomness indicates a bug in how the read view interacts with skipped update optimizations.
+    *   **DB-X Behavior**: It acts inconsistently. It returns the **new** version for Row 1 (`3`), but the **snapshot** version for Row 2 (`2`). Both rows were treated identically by the logic (skipped updates), yet they exhibit different visibility rules. This randomness indicates a bug in how the read view interacts with skipped update optimizations.
 
 
 
-#### Bug#41 Skipped Snapshot Creation due to "Impossible WHERE" optimization in Repeatable Read
+#### Bug#38 Skipped Snapshot Creation due to "Impossible WHERE" optimization in Repeatable Read
 
 **Test Case**
 
@@ -1084,31 +1009,9 @@ In Repeatable Read isolation level, the first read operation in a transaction sh
 
 Consequently, when the transaction executes a second query later, it creates the snapshot *at that moment*. If another transaction (Session 1) has committed data in the interim, this delayed snapshot creation causes the current transaction (Session 2) to see data committed *after* its logical start, violating the expected Repeatable Read behavior.
 
-This issue requires an index on the column used in the `WHERE` clause to trigger the specific optimization path. While present in MySQL 8.0/8.4, it is also observed in TDSQL, differing from systems like TiDB which handle this correctly.
+This issue requires an index on the column used in the `WHERE` clause to trigger the specific optimization path. While present in MySQL 8.0/8.4, it is also observed in DB-X, differing from systems like TiDB which handle this correctly.
 
 
-
-#### Bug#42 Deadlock between DML transaction and Partition DDL operations
-
-**Test Case**
-
-| **Transaction ID** | **Operation Detail**                                         | **State**                                                    |
-| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| Schema Creation    | drop table if exists table0;<br>create table table0 (pkId integer, pkAttr0 integer, commonAttr0_0 integer, commonAttr1_0 varchar(10), commonAttr2_0 double(10, 2), commonAttr3_0 varchar(10), commonAttr4_0 varchar(10), primary key(pkAttr0)) ROW_FORMAT = DYNAMIC  PARTITION BY KEY(pkAttr0)  PARTITIONS 4 ; | Success                                                      |
-| Session 1          | BEGIN;                                                       | Success                                                      |
-| Session 1          | select `pkId`, `commonAttr4_0`, `pkAttr0` from `table0` where ( `pkAttr0`  =  77  )  ; | Success                                                      |
-| Session 2          | **alter table table0 coalesce partition 1;**                 | **Blocked (Waiting for metadata lock held by S1)**           |
-| **Session 1**      | **update `table0` set `commonAttr1_0` = "CLf"... where (`pkAttr0`  =  132  );** | **ERROR 1213 (40001): Deadlock found when trying to get lock X** |
-
-**Bug Description**
-
-This bug manifests as a deadlock when a DML transaction runs concurrently with specific partition-related DDL operations on the same table.
-
-1.  **Session 1** starts a transaction and performs a read operation (`SELECT`), acquiring a shared metadata lock (MDL) on the table.
-2.  **Session 2** attempts a partition DDL (e.g., `COALESCE PARTITION`, `REORGANIZE PARTITION`, or `ADD PARTITION`). This requires an exclusive lock and is blocked by Session 1.
-3.  **Session 1** proceeds to perform an `UPDATE` on the same table.
-
-Instead of simply being blocked or successfully executing (depending on the exact lock compatibility), Session 1 immediately fails with a Deadlock error. This suggests a conflict in the wait graph between the DML locks and the pending Partition DDL locks. This behavior is also reproducible in MySQL (Bug #117735), but in TDSQL, the deadlock cycle is difficult to trace in the transaction logs.
 
 
 
@@ -1118,7 +1021,7 @@ Instead of simply being blocked or successfully executing (depending on the exac
 
 ### Isolation-related bugs
 
-#### Bug#43 Update with sub query uses incorrect snapshot.
+#### Bug#39 Update with sub query uses incorrect snapshot.
 
 See  [Update with sub query uses incorrect snapshot in RR isolation level · Issue #45677 · pingcap/tidb (github.com)](https://github.com/pingcap/tidb/issues/45677) 
 
@@ -1144,7 +1047,7 @@ Thus this execution is incompatible with MySQL.
 
 ### Isolation-related bugs
 
-#### Bug#44 Predicate Lock ERROR
+#### Bug#40 Predicate Lock ERROR
 
 See  [MySQL Bugs: #105988: The problem about predicate lock in Serializable isolation level](https://bugs.mysql.com/bug.php?id=105988) 
 
@@ -1170,7 +1073,7 @@ As definition, InnoDB implicitly converts all plain SELECT statements to SELECT 
 
 However, the fifth line has acquired a record-level exclusive lock on a record whose pkAttr0 is 225. The exclusive lock acquired by the fifth line is imcompatible with the shared lock acquired by the seventh line, which indicates a bug hidden in range-level lock.
 
-#### Bug#45 Read uncommitted transaction reads the result of a failed write operation
+#### Bug#41 Read uncommitted transaction reads the result of a failed write operation
 
 **Test Case**
 
@@ -1195,7 +1098,7 @@ Transaction 2 writes new versions on records 1 and 2 successively, while Transac
 
 ### Other types of Bugs
 
-#### Bug#46 Update BLOB data error
+#### Bug#42 Update BLOB data error
 
 **Test Case**
 
@@ -1215,7 +1118,7 @@ For BLOB data type, when the new value and the old value written by the update o
 
 ### Isolation-related bugs
 
-#### Bug#47 Write skew in SSI
+#### Bug#43 Write skew in SSI
 
 **Test Case**
 
@@ -1232,7 +1135,7 @@ For BLOB data type, when the new value and the old value written by the update o
 
 Transaction 206 reads a record 832 in table\_ 7\_ 1，then transaction 204 writes a new record to cover it, so transactions 206 to 204 have a RW dependency. Similarly, transaction 204 reads the record 1460 in table\_ 7\_ 4, then transaction 206 writes a new record to cover it, so transactions 204 to 206 have a RW dependency. Finally, transactions 204 to 206 generate a circular dependency, that is, write skew anomalies that should be avoided in Snapshot Isolation Level of PostgreSQL.
 
-#### Bug#48 Two different versions of the same row of records are returned in one query
+#### Bug#44 Two different versions of the same row of records are returned in one query
 
 See  [PostgreSQL: BUG #17017: Two versions of the same row of records are returned in one query](https://www.postgresql.org/message-id/17017-c37dbbadb77cfde9%40postgresql.org) 
 
@@ -1260,7 +1163,7 @@ According to the definition of snapshot isolation, a query in a transaction shou
 
 ### Isolation-related Bugs
 
-#### Bug#49 Violating First-Updater-Wins
+#### Bug#45 Violating First-Updater-Wins
 
 **Test Case**
 
@@ -1279,7 +1182,7 @@ According to the definition of snapshot isolation, a query in a transaction shou
 
 Transaction 1 starts before transaction 2 commit, and both transaction 1 and 2 write a new version on a record (280, 241,'vc204' , 'vc361' ,363 ). Therefore, transaction 1 and 2 are a pair of concurrent transaction, which should be avoided by first updater wins mechanism in OpenGauss.
 
-#### Bug#50 Violating Read-Consistency
+#### Bug#46 Violating Read-Consistency
 
 **Test Case**
 
@@ -1308,7 +1211,7 @@ Transaction 1 launch a update operation while fetches a consistent snapshot. Acc
 
 ### Isolation-related bugs
 
-#### Bug#51 Read inconsistency
+#### Bug#47 Read inconsistency
 
 **Test Case**
 
@@ -1332,4 +1235,30 @@ After confirmation with developer, the repeatable read isolation level of Oceanb
 However, Oceanbase violates the first rule of snapshot isolation. Specifically, after transaction 1 obtains the consistency snapshot, another parallel transaction 2 issues a write operation. Transaction 1 should not see the write result created by transaction 2. In practice, transaction 1 sees it.
 
 
+
+## DB-X
+
+### Isolation-related bugs
+
+#### Bug#48 Deadlock between DML transaction and Partition DDL operations
+
+**Test Case**
+
+| **Transaction ID** | **Operation Detail**                                         | **State**                                                    |
+| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Schema Creation    | drop table if exists table0;<br>create table table0 (pkId integer, pkAttr0 integer, commonAttr0_0 integer, commonAttr1_0 varchar(10), commonAttr2_0 double(10, 2), commonAttr3_0 varchar(10), commonAttr4_0 varchar(10), primary key(pkAttr0)) ROW_FORMAT = DYNAMIC  PARTITION BY KEY(pkAttr0)  PARTITIONS 4 ; | Success                                                      |
+| Session 1          | BEGIN;                                                       | Success                                                      |
+| Session 1          | select `pkId`, `commonAttr4_0`, `pkAttr0` from `table0` where ( `pkAttr0`  =  77  )  ; | Success                                                      |
+| Session 2          | **alter table table0 coalesce partition 1;**                 | **Blocked (Waiting for metadata lock held by S1)**           |
+| **Session 1**      | **update `table0` set `commonAttr1_0` = "CLf"... where (`pkAttr0`  =  132  );** | **ERROR 1213 (40001): Deadlock found when trying to get lock X** |
+
+**Bug Description**
+
+This bug manifests as a deadlock when a DML transaction runs concurrently with specific partition-related DDL operations on the same table.
+
+1.  **Session 1** starts a transaction and performs a read operation (`SELECT`), acquiring a shared metadata lock (MDL) on the table.
+2.  **Session 2** attempts a partition DDL (e.g., `COALESCE PARTITION`, `REORGANIZE PARTITION`, or `ADD PARTITION`). This requires an exclusive lock and is blocked by Session 1.
+3.  **Session 1** proceeds to perform an `UPDATE` on the same table.
+
+Instead of simply being blocked or successfully executing (depending on the exact lock compatibility), Session 1 immediately fails with a Deadlock error. This suggests a conflict in the wait graph between the DML locks and the pending Partition DDL locks. This behavior is also reproducible in MySQL (Bug #117735), but in DB-X, the deadlock cycle is difficult to trace in the transaction logs.
 
