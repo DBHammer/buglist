@@ -1,8 +1,8 @@
 # Bugs found in Database Management Systems
 
-We have successfully discovered 51 bugs (16 fixed, 39 confirmed and 12 open reported) from real-world production-level DBMSs, including 5 bugs in MySQL, 2 bugs in PostgreSQL, 19 bugs in TiDB, 3 bugs in OpenGauss, 3 bugs in Oceanbase, and 19 bugs in TDSQL.
+We have successfully discovered 51 bugs (16 fixed, 42 confirmed and 9 open reported) from real-world production-level DBMSs, including 5 bugs in MySQL, 2 bugs in PostgreSQL, 19 bugs in TiDB, 3 bugs in OpenGauss, 3 bugs in Oceanbase, and 19 bugs in TDSQL.
 
-We are thankful to the DBMS developers for responding to our bug reports and fixing the bugs that we found. Because the nondeterministic interleavings among operations challenges the reproducibility of the isolation-related bugs, there are 12 bugs can not be reproduced but open reported. In the future, we will aim to the research question about reproducing an isolation-related bug.
+We are thankful to the DBMS developers for responding to our bug reports and fixing the bugs that we found. Because the nondeterministic interleavings among operations challenges the reproducibility of the isolation-related bugs, there are 9 bugs can not be reproduced but open reported. In the future, we will aim to the research question about reproducing an isolation-related bug.
 
 We have anonymized the corresponding issue and other personal information due to the double-blind reviewing constraint.
 
@@ -607,230 +607,11 @@ The last query is expected to return (2), as that does in CLI, but it returns (1
 
 It is because OpenGauss is designed to get snapshot at the first non-transaction-control statement of each transaction, but jdbc requires a snapshot at begin.
 
-## Open reported bugs
-
-## TiDB
-
-### Isolation-related bugs
-
-#### Bug#24 Update with sub query uses incorrect snapshot.
-
-See  [Update with sub query uses incorrect snapshot in RR isolation level · Issue #45677 · pingcap/tidb (github.com)](https://github.com/pingcap/tidb/issues/45677) 
-
-**Test Case**
-
-| **Transaction ID**      | **Operation Detail**                                      | **State**                          |
-| ----------------------- | --------------------------------------------------------- | ---------------------------------- |
-| Schema Creation         | create table t(a int, b int);                             | Success                            |
-| Database Initialization | insert into t values(1,1);                                | Success                            |
-| 1                       | begin;                                                    | Success                            |
-| 2                       | update t set b=2 where a=1;                               | Success                            |
-| **1**                   | **update t set b=3 where b=(select b from t where b=2);** | **Success, affects 0 row**         |
-| 1                       | commit                                                    | Success                            |
-| **1**                   | **select \* from t;**                                     | **Returns (1,2) instead of (1,3)** |
-
-**Bug Description**
-
-Update is designed to read the last committed data. Thus the update in session 1 should read the data version (1,2). However, the sub query in update is executed as a single query and uses snapshot read, which read a earlier version(1,1).The snapshot read by sub query is different from that read by update and breaks the consistency in this single update SQL(with sub query), because a single SQL reads two snapshots.We test the same case in MySQL(v8.0.33), whose sub query read consistent snapshot as update.
-
-Thus this execution is incompatible with MySQL.
-
-## MySQL
-
-### Isolation-related bugs
-
-#### Bug#25 Predicate Lock ERROR
-
-See  [MySQL Bugs: #105988: The problem about predicate lock in Serializable isolation level](https://bugs.mysql.com/bug.php?id=105988) 
-
-**Test Case**
-
-| **Transaction ID** | **Operation Detail**                                         | **State**     |
-| ------------------ | ------------------------------------------------------------ | ------------- |
-| Schema Creation    | Create table table0 (pkId integer, pkAttr0 integer, coAttr0\_0 integer, primary key(pkAttr0)); | Success       |
-| Mode Setting       | Set autocommit = 0;                                          | Success       |
-| 69264              | SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;        | Success       |
-| 69269              | SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;        | Success       |
-| 69264              | START TRANSACTION;                                           | Success       |
-| 69264              | Insert into `table0`(`pkId`, `pkAttr0`, `coAttr0_0`) values(225, 225, 35704); | Success       |
-| 69269              | START TRANSACTION;                                           | Success       |
-| **69269**          | **Select `pkAttr0`, `coAttr0_0` from `table0` where ( `pkAttr0` = 225 );** | **Success X** |
-| 69264              | rollback                                                     | Success       |
-
-**Bug Description**
-
-We disable autocomit and set both the above two transactions as serializable isolation level, as shown in the second to third lines.
-
-As definition, InnoDB implicitly converts all plain SELECT statements to SELECT ... FOR SHARE if autocommit is disabled. Therefore, the seventh line should acquire a range-level shared lock to protect all records whose pkAttr0 is 225.
-
-However, the fifth line has acquired a record-level exclusive lock on a record whose pkAttr0 is 225. The exclusive lock acquired by the fifth line is imcompatible with the shared lock acquired by the seventh line, which indicates a bug hidden in range-level lock.
-
-#### Bug#26 Read uncommitted transaction reads the result of a failed write operation
-
-**Test Case**
-
-| **Transaction ID**      | **Operation Detail**                                         | **State**                          |
-| ----------------------- | ------------------------------------------------------------ | ---------------------------------- |
-| Schema Creation         | set global innodb\_deadlock\_detect=off;create table t(a int primary key, b int); | Success                            |
-| Database Initialization | insert into t values(1,2);insert into t values(2,4);         | Success                            |
-| 1                       | begin;                                                       | Success                            |
-| 2                       | begin;                                                       | Success                            |
-| 2                       | set session transaction isolation level read uncommitted;    | Success                            |
-| 3                       | begin;                                                       | Success                            |
-| 3                       | set session transaction isolation level read uncommitted;    | Success                            |
-| 2                       | delete from t where a=1;                                     | Success                            |
-| 3                       | update t set b=321 where a=2;                                | Success                            |
-| 2                       | update t set b=1421 where a=2;                               | Success                            |
-| 3                       | insert into t value(1,1231);                                 | Rollback                           |
-| 1                       | select \* from t where a=1;                                  | Returns (1,2) instead of empty set |
-
-**Bug Description**
-
-Transaction 2 writes new versions on records 1 and 2 successively, while Transaction 3 writes new versions on records 2 and 1 successively. So there is a deadlock situation between transaction 2 and 3. Before the deadlock between transaction 2 and 3 timeouts, another read uncommitted transaction 1 launch a query to read the record 1 that has been modified by transaction 2 and 3 successively. Since the second write operation of transaction 3 are failed due to deadlock, we should not see its write results. Therefore, as expected, the query result of transaction 1 should be the write result of transaction 2. However, the query result of transaction 1 is the write result before transaction 2, which is weird. We think there may be a subtle bug hidden in the current version of MySQL.
-
-### Other types of Bugs
-
-#### Bug#27 Update BLOB data error
-
-**Test Case**
-
-| **Operation ID**        | **Operation Detail**                                         | **State**                          |
-| ----------------------- | ------------------------------------------------------------ | ---------------------------------- |
-| Schema Creation         | create table t(pk0 int, pk1 int, pk2 int, attr3 blob);       | Success                            |
-| Database Initialization | insert into t values(1,1,1,null);                            |                                    |
-| 1                       | Update t set attr3=FILE("./data_case/obj/12obj_file.obj") where pk0=1 and pk1=1 and pk2= 1 | Success                            |
-| 2                       | Update t set attr3=FILE("./data_case/obj/12obj_file.obj") and other column where pk0 = 1 and pk1 = 1 and pk2 = 1 | Success                            |
-| **3**                   | **Select attr3 from t where pk0 = 1 and pk1 = 1 and pk2 = 1 for update** | **Success  Return attr3 = NULL X** |
-
-**Bug Description**
-
-For BLOB data type, when the new value and the old value written by the update operation are for the same binary file, the value actually written is null and success is returned, which indicates a BLOB-related bug hidden in MySQL.
-
-## PostgreSQL
-
-### Isolation-related bugs
-
-#### Bug#28 Write skew in SSI
-
-**Test Case**
-
-| **Transaction ID** | **Operation Detail**                                         | **State**   |
-| ------------------ | ------------------------------------------------------------ | ----------- |
-| 206                | Select attribute1 from table\_7\_1 where primarykey= 832     | Success     |
-| 204                | Select attribute1 from table\_7\_4 where primarykey= 1460    | Success     |
-| 206                | Update table\_7\_4 set attribute where primarykey=1460       | Success     |
-| 204                | Update table\_7\_1 set attribute1 = -635092 where primarykey= 832 | Success     |
-| 204                | Commit                                                       | Success     |
-| **206**            | **Commit**                                                   | **Success** |
-
-**Bug Description**
-
-Transaction 206 reads a record 832 in table\_ 7\_ 1，then transaction 204 writes a new record to cover it, so transactions 206 to 204 have a RW dependency. Similarly, transaction 204 reads the record 1460 in table\_ 7\_ 4, then transaction 206 writes a new record to cover it, so transactions 204 to 206 have a RW dependency. Finally, transactions 204 to 206 generate a circular dependency, that is, write skew anomalies that should be avoided in Snapshot Isolation Level of PostgreSQL.
-
-#### Bug#29 Two different versions of the same row of records are returned in one query
-
-See  [PostgreSQL: BUG #17017: Two versions of the same row of records are returned in one query](https://www.postgresql.org/message-id/17017-c37dbbadb77cfde9%40postgresql.org) 
-
-**Test Case**
-
-| **Transaction ID**      | **Operation Detail**                                 | **State**                               |
-| ----------------------- | ---------------------------------------------------- | --------------------------------------- |
-| Schema Creation         | Create Table t(a int primary key, b int);            | Success                                 |
-| Database Initialization | Insert into t values(1,2);Insert into t values(2,3); | Success                                 |
-| 1                       | begin;                                               | Success                                 |
-| 1                       | set transaction isolation level repeatable read;     | Success                                 |
-| 1                       | Select \* from t where a=1;                          | Success                                 |
-| 2                       | Begin;                                               | Success                                 |
-| 2                       | set transaction isolation level read committed;      | Success                                 |
-| 2                       | Delete from t where a=2;                             | Success                                 |
-| 2                       | Commit;                                              | Success                                 |
-| 1                       | Insert into t values(2,4);                           | Success                                 |
-| **1**                   | **Select \* from t where a=2;**                      | **Returns (2,4)(2,3) instead of (2,4)** |
-
-**Bug Description**
-
-According to the definition of snapshot isolation, a query in a transaction should always see a consistent view of the database. That is, it should see a consistent version for each record in the database. However, bug#20 shows that two different versions of the same record are returned to a query under the snapshot isolation of PostgreSQL. This certainly violates the definition of snapshot isolation. Thus, we report it to the PostgreSQL community.
-
-## OpenGauss
-
-### Isolation-related Bugs
-
-#### Bug#30 Violating First-Updater-Wins
-
-**Test Case**
-
-| Transaction ID | Session1                                                     | Session2                                                     | State                     |
-| -------------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------- |
-| 2              |                                                              | Begin;                                                       | Success                   |
-| 2              |                                                              | set session transaction isolation level repeatable read;     | Success                   |
-| 2              |                                                              | update "table0" set "coAttr31_0" = 1048.0 where ( "pkAttr0" = 280 ) and ( "pkAttr1"  = 241 ) and ( "pkAttr2" = ‘vc204’ ) and ( "pkAttr3" =  ‘vc361’ ) and ( "pkAttr4" = 363 );--row count=1 | Success                   |
-| 1              | Begin;                                                       |                                                              | Success                   |
-| 1              | set session transaction isolation level repeatable read;     |                                                              | Success                   |
-| 1              | select "pkAttr0", "pkAttr1", "pkAttr2", "pkAttr3", "pkAttr4", "pkAttr5", "pkAttr6", "pkAttr7", "fkAttr0\_0", "fkAttr0\_1", "fkAttr0\_2", "fkAttr0\_3", "fkAttr0\_4" from "view0" where ( "fkAttr0\_0" = 94 ) and ( "fkAttr0\_1" = 239 ) or ( "fkAttr0\_2" \< 'vc119' ) and ( "fkAttr0\_3" \> 'vc81u' ) and ( "fkAttr0\_4" = 278 ) ; |                                                              | Success                   |
-| 2              |                                                              | commit                                                       | Success                   |
-| **1**          | **delete from "table0" where ( "pkAttr0" = 280 ) and ( "pkAttr1" = 241 ) and ( "pkAttr2" = 'vc204' ) and ( "pkAttr3" = 'vc361' ) and ( "pkAttr4" = 363 );** |                                                              | **Success --row count=1** |
-
-**Bug Description**
-
-Transaction 1 starts before transaction 2 commit, and both transaction 1 and 2 write a new version on a record (280, 241,'vc204' , 'vc361' ,363 ). Therefore, transaction 1 and 2 are a pair of concurrent transaction, which should be avoided by first updater wins mechanism in OpenGauss.
-
-#### Bug#31 Violating Read-Consistency
-
-**Test Case**
-
-Create table table2 (primarykey int primary key, coAttr25\_0 int);
-
-Insert into table2 values(6,0);
-
-Insert into table2 values(7,0);
-
-| **Transaction ID** | **Session1**                                                 | **Session2**                                                 | **State**                                                |
-| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ | -------------------------------------------------------- |
-| 1                  | Begin;                                                       |                                                              | Success                                                  |
-| 1                  | set session transaction isolation level repeatable read;     |                                                              | Success                                                  |
-| 1                  | update "table2" set "coAttr25\_0" = 78354, where "primaryKey" = 7; |                                                              | Success                                                  |
-| 2                  |                                                              | Begin;                                                       | Success                                                  |
-| 2                  |                                                              | set session transaction isolation level repeatable read;     | Success                                                  |
-| 2                  |                                                              | "update "table2" set " coAttr25\_0" = 14 where "primaryKey" = 6; | Success                                                  |
-| 2                  |                                                              | Commit                                                       | Success                                                  |
-| **1**              | **Select "primaryKey", "fkAttr0\_0", "coAttr25\_0" from "table2";** |                                                              | **Success returns"primaryKey":"6", "coAttr25\_0": "14"** |
-
-**Bug Description**
-
-Transaction 1 launch a update operation while fetches a consistent snapshot. According to the rule of repeatable read isolation level, any operation in transaction 1 should sees a same snapshot., so transaction 1 should not see the write result created by transaction 2. However, transaction 1 sees the write result created by transaction 2, which indicates a consistency read violation.
-
-## Oceanbase
-
-### Isolation-related bugs
-
-#### Bug#32 Read inconsistency
-
-**Test Case**
-
-| Transaction ID | Session1                                                     | Session2                                                     | State                                                        |
-| -------------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| 1              | set session transaction isolation level repeatable read;     |                                                              | Success                                                      |
-| 2              |                                                              | set session transaction isolation level repeatable read;     | Success                                                      |
-| 1              | START TRANSACTION READ ONLY,WITH CONSISTENT SNAPSHOT;        |                                                              | Success                                                      |
-| 2              |                                                              | START TRANSACTION;                                           | Success                                                      |
-| 2              |                                                              | update table0 set coAttr17 = 19635, coAttr18 = 1244, coAttr19 = 92947 where ( pkAttr0 = 'vc239' ) and ( pkAttr1 = 'vc234' ) and ( pkAttr2 = 'vc233' ); | Success, affects 1 row                                       |
-| 2              |                                                              | COMMIT                                                       | Success                                                      |
-| **1**          | **select pkAttr0, pkAttr1, pkAttr2, coAttr17, coAttr18, coAttr19 from table0 order by pkAttr0 ;** |                                                              | **Success returns (vc239, vc234, vc233, 19635, 1244, 92947)** |
-
-**Bug Description**
-
-After confirmation with developer, the repeatable read isolation level of Oceanbase is consistent with snapshot isolation as defined in the paper "A Critique of ANSI SQL Isolation Levels". Specifically, snapshot isolation is define as:
-
-1. A read operation sees a snapshot as of the start of the transaction.
-2. No transaction modify the record that has been modified by another concurrent transaction.
-
-However, Oceanbase violates the first rule of snapshot isolation. Specifically, after transaction 1 obtains the consistency snapshot, another parallel transaction 2 issues a write operation. Transaction 1 should not see the write result created by transaction 2. In practice, transaction 1 sees it.
-
 
 
 ## TDSQL
 
-#### Bug#33 [Confirmed] Server Crash in deadlock scenario involving partitioned table
+#### Bug#24 Server Crash in deadlock scenario involving partitioned table
 
 **Test Case**
 
@@ -852,7 +633,7 @@ Subsequently, Session 1 attempts to update `tbl_1`. Note that `tbl_1` is a parti
 
 
 
-#### Bug#34 [Open] Unexpected deadlock with SELECT FOR SHARE and ALTER TABLE
+#### Bug#25 Unexpected deadlock with SELECT FOR SHARE and ALTER TABLE
 
 See [MySQL Bugs: #119521: Deadlock with SELECT FOR SHARE but not FOR UPDATE](https://bugs.mysql.com/bug.php?id=119521)
 
@@ -877,7 +658,7 @@ However, if the operation in Session 1 is changed from `LOCK IN SHARE MODE` (Sha
 
 
 
-#### Bug#35 [Confirmed] Server crash when using PreparedStatement with IN clause on partitioned table
+#### Bug#26 Server crash when using PreparedStatement with IN clause on partitioned table
 
 **Test Case**
 
@@ -894,7 +675,7 @@ When using a JDBC connection to execute a transaction, if a `PreparedStatement` 
 
 
 
-#### Bug#36 [Confirmed] JDBC connection broken after deadlock in specific versions
+#### Bug#27 JDBC connection broken after deadlock in specific versions
 
 **Test Case**
 
@@ -920,7 +701,7 @@ However, in TDSQL v2.5, triggering the deadlock causes the JDBC connection to br
 
 
 
-#### Bug#37 [Open] Inconsistent update in Read Committed when Primary Key is modified concurrently
+#### Bug#28 Inconsistent update in Read Committed when Primary Key is modified concurrently
 
 **Test Case**
 
@@ -951,7 +732,7 @@ TDSQL updates only 2 rows, leaving the row modified by Session 1 as `<2,3,null>`
 
 
 
-#### Bug#38 [Open] Potential Server Core Dump with complex INSERT/REPLACE sequence
+#### Bug#29 Potential Server Core Dump with complex INSERT/REPLACE sequence
 
 **Test Case**
 
@@ -970,7 +751,7 @@ The crash typically triggers on the final `INSERT IGNORE` statement in the seque
 
 
 
-#### Bug#39 [Confirmed] Inconsistent data and Primary Key violation after INSERT IGNORE
+#### Bug#30 Inconsistent data and Primary Key violation after INSERT IGNORE
 
 **Test Case**
 
@@ -991,6 +772,7 @@ This bug highlights a violation of the Primary Key uniqueness constraint and inc
 The table `t0` has a Primary Key on column `c1`. When executing `INSERT IGNORE` with three records containing the same duplicate key `c1=2`, the database should strictly insert only the first record and discard the others (Standard MySQL behavior results in 1 row: `2025-01-21`).
 
 However, TDSQL exhibits the following anomalies:
+
 1.  **Constraint Violation**: The `INSERT IGNORE` statement successfully inserts 2 rows, violating the primary key constraint.
 2.  **Inconsistent Reads (Default Engine)**: A simple `SELECT *` scan returns 2 rows (showing duplicate PKs), whereas `SELECT COUNT(*)` returns only 1 row.
 3.  **Engine Discrepancy (Vector Engine)**: When switching to the Vector Engine, `SELECT *` returns 1 row, but it returns the *last* inserted value (`2026-05-28`) instead of the first one (`2025-01-21`).
@@ -999,7 +781,7 @@ This issue appears to be specific to tables containing `DATE` and `INT` columns 
 
 
 
-#### Bug#40 [Confirmed] Transaction implicitly rolled back when JDBC Query Timeout occurs in a Deadlock scenario
+#### Bug#31 Transaction implicitly rolled back when JDBC Query Timeout occurs in a Deadlock scenario
 
 **Test Case**
 
@@ -1026,6 +808,7 @@ This bug occurs when using the JDBC `setQueryTimeout` method in a concurrency sc
 3.  **Session 1** attempts to read Row B with `FOR UPDATE`. This forms a circular dependency (Deadlock): Session 1 holds A, wants B; Session 2 holds B, wants A.
 
 If Session 1 has a short query timeout (e.g., 2 seconds) set via JDBC:
+
 *   **MySQL Behavior**: It typically detects the deadlock immediately and rolls back the victim transaction (usually Session 2), or if the timeout triggers first, it cancels the statement.
 *   **TDSQL Behavior**: Session 1 throws a `MySQLTimeoutException` (Statement cancelled). The application catches this and executes `COMMIT`. However, the data updated by Session 1 earlier (Row A = 347) is **lost**.
 
@@ -1033,7 +816,7 @@ This implies that although TDSQL threw a "Timeout" exception to the client, it i
 
 
 
-#### Bug#41 [Confirmed] Server crash when parsing PreparedStatement with parameter in subquery projection
+#### Bug#32 Server crash when parsing PreparedStatement with parameter in subquery projection
 
 **Test Case**
 
@@ -1054,7 +837,7 @@ This behavior differs from MySQL 8.4.3, which handles this syntax correctly with
 
 
 
-#### Bug#42 [Confirmed] Server crash during concurrent shared lock reads on partitioned table
+#### Bug#33 Server crash during concurrent shared lock reads on partitioned table
 
 **Test Case**
 
@@ -1069,6 +852,7 @@ This behavior differs from MySQL 8.4.3, which handles this syntax correctly with
 This bug involves a server crash (Signal 11) when executing concurrent read operations with `LOCK IN SHARE MODE` on a partitioned table.
 
 The conditions for reproduction are specific:
+
 1.  The table must be **partitioned** (e.g., `PARTITION BY key(k)`).
 2.  The query uses **`LOCK IN SHARE MODE`** (tests show that `FOR UPDATE` does not trigger this issue).
 3.  The query filters on a non-partition key column (`v`), likely causing scanning or locking across partitions.
@@ -1078,7 +862,7 @@ The crash occurs in the transaction locking module, specifically during the unlo
 
 
 
-#### Bug#43 [Confirmed] Unique index violation in Read Committed with concurrent updates
+#### Bug#34 Unique index violation in Read Committed with concurrent updates
 
 **Test Case**
 
@@ -1105,7 +889,7 @@ In MySQL, Transaction 2 would be blocked waiting for the lock on the unique inde
 
 
 
-#### Bug#44 [Confirmed] Transaction forced to rollback after Duplicate Entry error in multi-row insert
+#### Bug#35 Transaction forced to rollback after Duplicate Entry error in multi-row insert
 
 **Test Case**
 
@@ -1128,7 +912,7 @@ In TDSQL, triggering a duplicate entry error during a multi-row insert causes th
 
 
 
-#### Bug#45 [Confirmed] Deadlock and Timeout during concurrent ADD INDEX and Transactions on partitioned table
+#### Bug#36 Deadlock and Timeout during concurrent ADD INDEX and Transactions on partitioned table
 
 **Test Case**
 
@@ -1145,11 +929,13 @@ In TDSQL, triggering a duplicate entry error during a multi-row insert causes th
 On a partitioned table (even if empty), executing an `ALTER TABLE ... ADD INDEX` operation concurrently with specific Read and Write transactions leads to a deadlock-like hang, eventually causing the DDL to timeout and the transaction to fail.
 
 The scenario requires three concurrent operations:
+
 1.  An `ADD INDEX` DDL operation.
 2.  A Transaction performing a `SELECT` based on the column being indexed.
 3.  A Transaction performing an `UPDATE` based on the primary key.
 
 While the Read transaction (Session 2) typically completes, the DDL (Session 1) and the Write transaction (Session 3) block each other.
+
 *   **Session 1** eventually fails with: `Lock wait timeout exceeded; try restarting transaction.`
 *   **Session 3** fails with an internal engine error: `[SQLEngine] resp.regions_meta is invalid`.
 
@@ -1157,7 +943,7 @@ Inspection of `sys.x$schema_table_lock_waits` shows the DDL waiting for an `EXCL
 
 
 
-#### Bug#46 [Confirmed] Inconsistent query results between Unique and Non-Unique indexes after concurrent PK update
+#### Bug#37 Inconsistent query results between Unique and Non-Unique indexes after concurrent PK update
 
 **Test Case**
 
@@ -1192,7 +978,7 @@ While returning both versions (Ghost Rows) might be an anomaly in itself (violat
 
 
 
-#### Bug#47 [Confirmed] Non-deterministic read results in repeated transactions with Partition Key updates
+#### Bug#38 Non-deterministic read results in repeated transactions with Partition Key updates
 
 **Test Case**
 
@@ -1216,6 +1002,7 @@ While returning both versions (Ghost Rows) might be an anomaly in itself (violat
 This bug demonstrates inconsistent read behavior when executing the exact same transaction logic twice, separated by a rollback.
 
 The transaction performs an `UPDATE` that modifies the Partition Key (`col_1_1`) and another column (`col_1_4`) of a row.
+
 1.  **First Execution**: The subsequent `SELECT` query incorrectly returns the old version of the updated row (`1,2`), even though `col_1_4` was updated to 0 (which should result in the row being filtered out). This suggests the query in the first transaction failed to see the effects of its own partition-key update.
 2.  **Second Execution**: After rolling back and retrying the exact same operations, the `SELECT` query correctly returns only the non-updated row (`1,3`).
 
@@ -1223,7 +1010,7 @@ Since the first transaction was rolled back, the database state should be identi
 
 
 
-#### Bug#48 [Confirmed] Ghost rows returned when updating Partition Key in transaction
+#### Bug#39 Ghost rows returned when updating Partition Key in transaction
 
 **Test Case**
 
@@ -1246,7 +1033,7 @@ This anomaly is triggered only if the `UPDATE` is preceded by a `DELETE` stateme
 
 
 
-#### Bug#49 [Confirmed] Inconsistent visibility of "no-op" updates in Repeatable Read isolation
+#### Bug#40 Inconsistent visibility of "no-op" updates in Repeatable Read isolation
 
 **Test Case**
 
@@ -1276,7 +1063,7 @@ This bug highlights an inconsistency in how "no-op" updates (updates where the n
 
 
 
-#### Bug#50 [Confirmed] Skipped Snapshot Creation due to "Impossible WHERE" optimization in Repeatable Read
+#### Bug#41 Skipped Snapshot Creation due to "Impossible WHERE" optimization in Repeatable Read
 
 **Test Case**
 
@@ -1301,7 +1088,7 @@ This issue requires an index on the column used in the `WHERE` clause to trigger
 
 
 
-#### Bug#51 [Confirmed] Deadlock between DML transaction and Partition DDL operations
+#### Bug#42 Deadlock between DML transaction and Partition DDL operations
 
 **Test Case**
 
@@ -1322,3 +1109,227 @@ This bug manifests as a deadlock when a DML transaction runs concurrently with s
 3.  **Session 1** proceeds to perform an `UPDATE` on the same table.
 
 Instead of simply being blocked or successfully executing (depending on the exact lock compatibility), Session 1 immediately fails with a Deadlock error. This suggests a conflict in the wait graph between the DML locks and the pending Partition DDL locks. This behavior is also reproducible in MySQL (Bug #117735), but in TDSQL, the deadlock cycle is difficult to trace in the transaction logs.
+
+
+
+## Open reported bugs
+
+## TiDB
+
+### Isolation-related bugs
+
+#### Bug#43 Update with sub query uses incorrect snapshot.
+
+See  [Update with sub query uses incorrect snapshot in RR isolation level · Issue #45677 · pingcap/tidb (github.com)](https://github.com/pingcap/tidb/issues/45677) 
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                                      | **State**                          |
+| ----------------------- | --------------------------------------------------------- | ---------------------------------- |
+| Schema Creation         | create table t(a int, b int);                             | Success                            |
+| Database Initialization | insert into t values(1,1);                                | Success                            |
+| 1                       | begin;                                                    | Success                            |
+| 2                       | update t set b=2 where a=1;                               | Success                            |
+| **1**                   | **update t set b=3 where b=(select b from t where b=2);** | **Success, affects 0 row**         |
+| 1                       | commit                                                    | Success                            |
+| **1**                   | **select \* from t;**                                     | **Returns (1,2) instead of (1,3)** |
+
+**Bug Description**
+
+Update is designed to read the last committed data. Thus the update in session 1 should read the data version (1,2). However, the sub query in update is executed as a single query and uses snapshot read, which read a earlier version(1,1).The snapshot read by sub query is different from that read by update and breaks the consistency in this single update SQL(with sub query), because a single SQL reads two snapshots.We test the same case in MySQL(v8.0.33), whose sub query read consistent snapshot as update.
+
+Thus this execution is incompatible with MySQL.
+
+## MySQL
+
+### Isolation-related bugs
+
+#### Bug#44 Predicate Lock ERROR
+
+See  [MySQL Bugs: #105988: The problem about predicate lock in Serializable isolation level](https://bugs.mysql.com/bug.php?id=105988) 
+
+**Test Case**
+
+| **Transaction ID** | **Operation Detail**                                         | **State**     |
+| ------------------ | ------------------------------------------------------------ | ------------- |
+| Schema Creation    | Create table table0 (pkId integer, pkAttr0 integer, coAttr0\_0 integer, primary key(pkAttr0)); | Success       |
+| Mode Setting       | Set autocommit = 0;                                          | Success       |
+| 69264              | SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;        | Success       |
+| 69269              | SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;        | Success       |
+| 69264              | START TRANSACTION;                                           | Success       |
+| 69264              | Insert into `table0`(`pkId`, `pkAttr0`, `coAttr0_0`) values(225, 225, 35704); | Success       |
+| 69269              | START TRANSACTION;                                           | Success       |
+| **69269**          | **Select `pkAttr0`, `coAttr0_0` from `table0` where ( `pkAttr0` = 225 );** | **Success X** |
+| 69264              | rollback                                                     | Success       |
+
+**Bug Description**
+
+We disable autocomit and set both the above two transactions as serializable isolation level, as shown in the second to third lines.
+
+As definition, InnoDB implicitly converts all plain SELECT statements to SELECT ... FOR SHARE if autocommit is disabled. Therefore, the seventh line should acquire a range-level shared lock to protect all records whose pkAttr0 is 225.
+
+However, the fifth line has acquired a record-level exclusive lock on a record whose pkAttr0 is 225. The exclusive lock acquired by the fifth line is imcompatible with the shared lock acquired by the seventh line, which indicates a bug hidden in range-level lock.
+
+#### Bug#45 Read uncommitted transaction reads the result of a failed write operation
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                                         | **State**                          |
+| ----------------------- | ------------------------------------------------------------ | ---------------------------------- |
+| Schema Creation         | set global innodb\_deadlock\_detect=off;create table t(a int primary key, b int); | Success                            |
+| Database Initialization | insert into t values(1,2);insert into t values(2,4);         | Success                            |
+| 1                       | begin;                                                       | Success                            |
+| 2                       | begin;                                                       | Success                            |
+| 2                       | set session transaction isolation level read uncommitted;    | Success                            |
+| 3                       | begin;                                                       | Success                            |
+| 3                       | set session transaction isolation level read uncommitted;    | Success                            |
+| 2                       | delete from t where a=1;                                     | Success                            |
+| 3                       | update t set b=321 where a=2;                                | Success                            |
+| 2                       | update t set b=1421 where a=2;                               | Success                            |
+| 3                       | insert into t value(1,1231);                                 | Rollback                           |
+| 1                       | select \* from t where a=1;                                  | Returns (1,2) instead of empty set |
+
+**Bug Description**
+
+Transaction 2 writes new versions on records 1 and 2 successively, while Transaction 3 writes new versions on records 2 and 1 successively. So there is a deadlock situation between transaction 2 and 3. Before the deadlock between transaction 2 and 3 timeouts, another read uncommitted transaction 1 launch a query to read the record 1 that has been modified by transaction 2 and 3 successively. Since the second write operation of transaction 3 are failed due to deadlock, we should not see its write results. Therefore, as expected, the query result of transaction 1 should be the write result of transaction 2. However, the query result of transaction 1 is the write result before transaction 2, which is weird. We think there may be a subtle bug hidden in the current version of MySQL.
+
+### Other types of Bugs
+
+#### Bug#46 Update BLOB data error
+
+**Test Case**
+
+| **Operation ID**        | **Operation Detail**                                         | **State**                          |
+| ----------------------- | ------------------------------------------------------------ | ---------------------------------- |
+| Schema Creation         | create table t(pk0 int, pk1 int, pk2 int, attr3 blob);       | Success                            |
+| Database Initialization | insert into t values(1,1,1,null);                            |                                    |
+| 1                       | Update t set attr3=FILE("./data_case/obj/12obj_file.obj") where pk0=1 and pk1=1 and pk2= 1 | Success                            |
+| 2                       | Update t set attr3=FILE("./data_case/obj/12obj_file.obj") and other column where pk0 = 1 and pk1 = 1 and pk2 = 1 | Success                            |
+| **3**                   | **Select attr3 from t where pk0 = 1 and pk1 = 1 and pk2 = 1 for update** | **Success  Return attr3 = NULL X** |
+
+**Bug Description**
+
+For BLOB data type, when the new value and the old value written by the update operation are for the same binary file, the value actually written is null and success is returned, which indicates a BLOB-related bug hidden in MySQL.
+
+## PostgreSQL
+
+### Isolation-related bugs
+
+#### Bug#47 Write skew in SSI
+
+**Test Case**
+
+| **Transaction ID** | **Operation Detail**                                         | **State**   |
+| ------------------ | ------------------------------------------------------------ | ----------- |
+| 206                | Select attribute1 from table\_7\_1 where primarykey= 832     | Success     |
+| 204                | Select attribute1 from table\_7\_4 where primarykey= 1460    | Success     |
+| 206                | Update table\_7\_4 set attribute where primarykey=1460       | Success     |
+| 204                | Update table\_7\_1 set attribute1 = -635092 where primarykey= 832 | Success     |
+| 204                | Commit                                                       | Success     |
+| **206**            | **Commit**                                                   | **Success** |
+
+**Bug Description**
+
+Transaction 206 reads a record 832 in table\_ 7\_ 1，then transaction 204 writes a new record to cover it, so transactions 206 to 204 have a RW dependency. Similarly, transaction 204 reads the record 1460 in table\_ 7\_ 4, then transaction 206 writes a new record to cover it, so transactions 204 to 206 have a RW dependency. Finally, transactions 204 to 206 generate a circular dependency, that is, write skew anomalies that should be avoided in Snapshot Isolation Level of PostgreSQL.
+
+#### Bug#48 Two different versions of the same row of records are returned in one query
+
+See  [PostgreSQL: BUG #17017: Two versions of the same row of records are returned in one query](https://www.postgresql.org/message-id/17017-c37dbbadb77cfde9%40postgresql.org) 
+
+**Test Case**
+
+| **Transaction ID**      | **Operation Detail**                                 | **State**                               |
+| ----------------------- | ---------------------------------------------------- | --------------------------------------- |
+| Schema Creation         | Create Table t(a int primary key, b int);            | Success                                 |
+| Database Initialization | Insert into t values(1,2);Insert into t values(2,3); | Success                                 |
+| 1                       | begin;                                               | Success                                 |
+| 1                       | set transaction isolation level repeatable read;     | Success                                 |
+| 1                       | Select \* from t where a=1;                          | Success                                 |
+| 2                       | Begin;                                               | Success                                 |
+| 2                       | set transaction isolation level read committed;      | Success                                 |
+| 2                       | Delete from t where a=2;                             | Success                                 |
+| 2                       | Commit;                                              | Success                                 |
+| 1                       | Insert into t values(2,4);                           | Success                                 |
+| **1**                   | **Select \* from t where a=2;**                      | **Returns (2,4)(2,3) instead of (2,4)** |
+
+**Bug Description**
+
+According to the definition of snapshot isolation, a query in a transaction should always see a consistent view of the database. That is, it should see a consistent version for each record in the database. However, bug#20 shows that two different versions of the same record are returned to a query under the snapshot isolation of PostgreSQL. This certainly violates the definition of snapshot isolation. Thus, we report it to the PostgreSQL community.
+
+## OpenGauss
+
+### Isolation-related Bugs
+
+#### Bug#49 Violating First-Updater-Wins
+
+**Test Case**
+
+| Transaction ID | Session1                                                     | Session2                                                     | State                     |
+| -------------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------- |
+| 2              |                                                              | Begin;                                                       | Success                   |
+| 2              |                                                              | set session transaction isolation level repeatable read;     | Success                   |
+| 2              |                                                              | update "table0" set "coAttr31_0" = 1048.0 where ( "pkAttr0" = 280 ) and ( "pkAttr1"  = 241 ) and ( "pkAttr2" = ‘vc204’ ) and ( "pkAttr3" =  ‘vc361’ ) and ( "pkAttr4" = 363 );--row count=1 | Success                   |
+| 1              | Begin;                                                       |                                                              | Success                   |
+| 1              | set session transaction isolation level repeatable read;     |                                                              | Success                   |
+| 1              | select "pkAttr0", "pkAttr1", "pkAttr2", "pkAttr3", "pkAttr4", "pkAttr5", "pkAttr6", "pkAttr7", "fkAttr0\_0", "fkAttr0\_1", "fkAttr0\_2", "fkAttr0\_3", "fkAttr0\_4" from "view0" where ( "fkAttr0\_0" = 94 ) and ( "fkAttr0\_1" = 239 ) or ( "fkAttr0\_2" \< 'vc119' ) and ( "fkAttr0\_3" \> 'vc81u' ) and ( "fkAttr0\_4" = 278 ) ; |                                                              | Success                   |
+| 2              |                                                              | commit                                                       | Success                   |
+| **1**          | **delete from "table0" where ( "pkAttr0" = 280 ) and ( "pkAttr1" = 241 ) and ( "pkAttr2" = 'vc204' ) and ( "pkAttr3" = 'vc361' ) and ( "pkAttr4" = 363 );** |                                                              | **Success --row count=1** |
+
+**Bug Description**
+
+Transaction 1 starts before transaction 2 commit, and both transaction 1 and 2 write a new version on a record (280, 241,'vc204' , 'vc361' ,363 ). Therefore, transaction 1 and 2 are a pair of concurrent transaction, which should be avoided by first updater wins mechanism in OpenGauss.
+
+#### Bug#50 Violating Read-Consistency
+
+**Test Case**
+
+Create table table2 (primarykey int primary key, coAttr25\_0 int);
+
+Insert into table2 values(6,0);
+
+Insert into table2 values(7,0);
+
+| **Transaction ID** | **Session1**                                                 | **Session2**                                                 | **State**                                                |
+| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ | -------------------------------------------------------- |
+| 1                  | Begin;                                                       |                                                              | Success                                                  |
+| 1                  | set session transaction isolation level repeatable read;     |                                                              | Success                                                  |
+| 1                  | update "table2" set "coAttr25\_0" = 78354, where "primaryKey" = 7; |                                                              | Success                                                  |
+| 2                  |                                                              | Begin;                                                       | Success                                                  |
+| 2                  |                                                              | set session transaction isolation level repeatable read;     | Success                                                  |
+| 2                  |                                                              | "update "table2" set " coAttr25\_0" = 14 where "primaryKey" = 6; | Success                                                  |
+| 2                  |                                                              | Commit                                                       | Success                                                  |
+| **1**              | **Select "primaryKey", "fkAttr0\_0", "coAttr25\_0" from "table2";** |                                                              | **Success returns"primaryKey":"6", "coAttr25\_0": "14"** |
+
+**Bug Description**
+
+Transaction 1 launch a update operation while fetches a consistent snapshot. According to the rule of repeatable read isolation level, any operation in transaction 1 should sees a same snapshot., so transaction 1 should not see the write result created by transaction 2. However, transaction 1 sees the write result created by transaction 2, which indicates a consistency read violation.
+
+## Oceanbase
+
+### Isolation-related bugs
+
+#### Bug#51 Read inconsistency
+
+**Test Case**
+
+| Transaction ID | Session1                                                     | Session2                                                     | State                                                        |
+| -------------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| 1              | set session transaction isolation level repeatable read;     |                                                              | Success                                                      |
+| 2              |                                                              | set session transaction isolation level repeatable read;     | Success                                                      |
+| 1              | START TRANSACTION READ ONLY,WITH CONSISTENT SNAPSHOT;        |                                                              | Success                                                      |
+| 2              |                                                              | START TRANSACTION;                                           | Success                                                      |
+| 2              |                                                              | update table0 set coAttr17 = 19635, coAttr18 = 1244, coAttr19 = 92947 where ( pkAttr0 = 'vc239' ) and ( pkAttr1 = 'vc234' ) and ( pkAttr2 = 'vc233' ); | Success, affects 1 row                                       |
+| 2              |                                                              | COMMIT                                                       | Success                                                      |
+| **1**          | **select pkAttr0, pkAttr1, pkAttr2, coAttr17, coAttr18, coAttr19 from table0 order by pkAttr0 ;** |                                                              | **Success returns (vc239, vc234, vc233, 19635, 1244, 92947)** |
+
+**Bug Description**
+
+After confirmation with developer, the repeatable read isolation level of Oceanbase is consistent with snapshot isolation as defined in the paper "A Critique of ANSI SQL Isolation Levels". Specifically, snapshot isolation is define as:
+
+1. A read operation sees a snapshot as of the start of the transaction.
+2. No transaction modify the record that has been modified by another concurrent transaction.
+
+However, Oceanbase violates the first rule of snapshot isolation. Specifically, after transaction 1 obtains the consistency snapshot, another parallel transaction 2 issues a write operation. Transaction 1 should not see the write result created by transaction 2. In practice, transaction 1 sees it.
+
+
+
